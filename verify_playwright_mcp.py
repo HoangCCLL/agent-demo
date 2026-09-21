@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import argparse
+import base64
 import os
 import sys
+from pathlib import Path
 
 from mcp_client import McpClient, result_text
 
@@ -11,6 +13,8 @@ def main():
     parser.add_argument("--url", default=os.getenv("PLAYWRIGHT_MCP_URL", "http://127.0.0.1:18082/mcp"))
     parser.add_argument("--target", default="http://test-site/")
     parser.add_argument("--token-env", default="MCP_AUTH_TOKEN")
+    parser.add_argument("--screenshot-output")
+    parser.add_argument("--vision-marker", default="VISION_7F31")
     args = parser.parse_args()
     token = os.getenv(args.token_env)
     if not token:
@@ -63,7 +67,17 @@ def main():
             raise RuntimeError("form interaction did not update the page")
         print("PASS  form input + click")
 
-        result_text(client.call_tool("browser_take_screenshot", {"type": "png", "fullPage": True, "scale": "css"}))
+        result_text(client.call_tool("browser_evaluate", {
+            "function": f"() => document.querySelector('h1').textContent = {args.vision_marker!r}",
+        }))
+        screenshot = client.call_tool("browser_take_screenshot", {
+            "type": "png", "fullPage": True, "scale": "css",
+        })
+        images = [item for item in screenshot.get("content", []) if item.get("type") == "image"]
+        if not images:
+            raise RuntimeError("screenshot returned no image content")
+        if args.screenshot_output:
+            Path(args.screenshot_output).write_bytes(base64.b64decode(images[0]["data"]))
         print("PASS  screenshot")
         download = result_text(client.call_tool("browser_click", {"target": "#download"}))
         if "download" not in download.lower():

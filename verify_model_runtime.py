@@ -2,13 +2,26 @@
 """Runtime checks beyond the minimum Codex Responses API contract."""
 
 import argparse
+import base64
 import concurrent.futures
 import json
 import os
 import sys
 import urllib.request
+from pathlib import Path
 
 from check_codex_api import output_text, request_json
+
+
+def image_input(path):
+    encoded = base64.b64encode(Path(path).read_bytes()).decode()
+    return [
+        {
+            "type": "input_text",
+            "text": "Transcribe the main heading in this image. Reply with only that heading.",
+        },
+        {"type": "input_image", "image_url": f"data:image/png;base64,{encoded}"},
+    ]
 
 
 def main():
@@ -18,6 +31,8 @@ def main():
     parser.add_argument("--concurrency", type=int, default=3)
     parser.add_argument("--timeout", type=float, default=90)
     parser.add_argument("--api-key-env", default="OPENAI_API_KEY")
+    parser.add_argument("--vision-image")
+    parser.add_argument("--vision-expected", default="VISION_7F31")
     args = parser.parse_args()
     base_url = args.base_url.rstrip("/")
     api_key = os.getenv(args.api_key_env)
@@ -51,6 +66,25 @@ def main():
         return f"{body.get('usage', {}).get('total_tokens', '?')} tokens"
 
     required("reasoning response", reasoning_check)
+
+    vision_supported = False
+
+    def vision_check():
+        nonlocal vision_supported
+        if not args.vision_image:
+            raise RuntimeError("no --vision-image supplied")
+        body = post({
+            "model": args.model,
+            "input": [{"role": "user", "content": image_input(args.vision_image)}],
+            "max_output_tokens": 128,
+        })
+        actual = output_text(body).strip()
+        if actual != args.vision_expected:
+            raise RuntimeError(f"expected {args.vision_expected!r}, got {actual!r}")
+        vision_supported = True
+        return args.vision_expected
+
+    optional("image input", vision_check)
 
     def context_check():
         marker = "CONTEXT_MARKER_7F31"
@@ -158,6 +192,7 @@ def main():
 
     required("stream cancellation", cancellation_check)
 
+    print("VISION_SUPPORTED" if vision_supported else "VISION_GAP")
     print("\nMODEL_RUNTIME_READY" if not failed else "\nMODEL_RUNTIME_FAILED")
     return 1 if failed else 0
 
