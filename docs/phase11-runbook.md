@@ -38,8 +38,30 @@ Accept the service host only when its final marker is `PHASE11_LOCAL_READY`.
 
 ## 2. Restrict the service VPS firewall
 
-Allow the published authenticated proxy ports only from each Codex client IP.
-For a client at `192.0.2.31`:
+Before changing UFW on a remote VPS, preserve and test its SSH/management
+access from a second session. Inspect the current firewall:
+
+```bash
+sudo ufw status verbose
+sudo ufw status numbered
+```
+
+Continue only when UFW is `active` and its default incoming policy is `deny`.
+Do not blindly change the default policy on a remote host; if this prerequisite
+is not already met, stop and have the host firewall policy reviewed first.
+
+In the numbered output, inspect every existing rule for TCP `18081` and
+`18082`. Remove only pre-existing broad/public MCP allows after confirming the
+rule number and that it is not needed; numbers change after every deletion, so
+re-run the inspection before each removal:
+
+```bash
+sudo ufw delete <confirmed-rule-number>
+sudo ufw status numbered
+```
+
+Then allow the published authenticated proxy ports only from each approved
+Codex client IP. For a client at `192.0.2.31`:
 
 ```bash
 sudo ufw allow from 192.0.2.31 to 192.0.2.20 port 18081 proto tcp
@@ -47,9 +69,17 @@ sudo ufw allow from 192.0.2.31 to 192.0.2.20 port 18082 proto tcp
 ```
 
 Repeat those two rules for every approved client IP; do not add a broad
-subnet/public allow rule. The rendered Compose configuration must publish only
-Search MCP on `18081` and the Playwright authentication proxy on `18082`.
-SearXNG, Playwright itself, and `test-site` remain Docker-internal.
+subnet/public allow rule. Verify the final rules:
+
+```bash
+sudo ufw status numbered
+```
+
+The only final rules for ports `18081` and `18082` must be per-client,
+source-specific TCP allows; retain the separate SSH/management rules. The
+rendered Compose configuration must publish only Search MCP on `18081` and the
+Playwright authentication proxy on `18082`. SearXNG, Playwright itself, and
+`test-site` remain Docker-internal.
 
 Plain HTTP with a bearer token is permitted only on an isolated demo LAN. Use
 TLS or a trusted encrypted WireGuard/Tailscale overlay before crossing an
