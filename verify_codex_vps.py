@@ -7,12 +7,12 @@ import os
 import re
 import secrets
 import shlex
-import shutil
 import subprocess
 import sys
 import tempfile
 import tomllib
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 GATES = (
@@ -86,9 +86,11 @@ def contains(value, marker):
 def completed_items(events, kind):
     def objects(value):
         if isinstance(value, dict):
-            yield value
-            for child in value.values():
-                yield from objects(child)
+            if value.get("type") not in (None, "item.completed"):
+                yield value
+                return
+            for key in ("item", "payload", "data"):
+                yield from objects(value.get(key))
         elif isinstance(value, list):
             for child in value:
                 yield from objects(child)
@@ -98,12 +100,12 @@ def completed_items(events, kind):
 
 
 def fields(value, name):
-    """Find named evidence through wrappers, without reading tool arguments/results as metadata."""
+    """Read item metadata, including the known invocation wrapper, never tool payloads."""
     if isinstance(value, dict):
         for key, child in value.items():
             if key == name:
                 yield child
-            elif key not in ("arguments", "result"):
+            elif key == "invocation":
                 yield from fields(child, name)
     elif isinstance(value, list):
         for child in value:
@@ -215,12 +217,23 @@ def codex_exec(prompt, cwd, env, timeout, sandbox="read-only", resume=None, revi
                "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
                "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true"]
     if review:
-        command += ["review", "--json", "--uncommitted", prompt + SAFE_PROMPT]
+        command += ["review", "--json", prompt + SAFE_PROMPT]
     elif resume:
         command += ["resume", "--json", resume, prompt + SAFE_PROMPT]
     else:
         command += ["--json", prompt + SAFE_PROMPT]
     return parse_jsonl(run(command, cwd, env, timeout).stdout)
+
+
+def normalized_base_url(url):
+    if not isinstance(url, str):
+        raise RuntimeError("set a valid HTTP(S) model base_url and LLM_BASE_URL")
+    parsed = urlsplit(url)
+    if (parsed.scheme not in ("http", "https") or not parsed.hostname
+            or parsed.username or parsed.password or parsed.query or parsed.fragment):
+        raise RuntimeError("model base URLs must be HTTP(S) URLs without credentials, query, or fragment")
+    port = parsed.port if parsed.port is not None else (443 if parsed.scheme == "https" else 80)
+    return parsed.scheme, parsed.hostname, port, parsed.path.rstrip("/")
 
 
 def isolated_codex_home(root, env):
@@ -230,21 +243,40 @@ def isolated_codex_home(root, env):
     config_path = source / "config.toml"
     if not config_path.is_file():
         raise RuntimeError(f"missing {config_path}; configure Codex on this VPS first")
-    config = tomllib.loads(config_path.read_text())
+    config_text = config_path.read_text()
+    config = tomllib.loads(config_text)
+    if config.get("profile"):
+        raise RuntimeError("selected profiles are not verified; configure the base config.toml without profile")
+    if not env.get("LLM_MODEL") or config.get("model") != env["LLM_MODEL"]:
+        raise RuntimeError("Codex model must equal LLM_MODEL in the base config.toml")
+    if config.get("review_model", config["model"]) != config["model"]:
+        raise RuntimeError("Codex review_model must equal LLM_MODEL or be unset")
     provider = config.get("model_providers", {}).get(config.get("model_provider"), {})
+    if not isinstance(provider, dict) or not provider:
+        raise RuntimeError("selected model_provider must exist in model_providers")
+    if normalized_base_url(provider.get("base_url")) != normalized_base_url(env.get("LLM_BASE_URL")):
+        raise RuntimeError("Codex provider base_url must equal LLM_BASE_URL")
+    if provider.get("wire_api", "responses") != "responses":
+        raise RuntimeError("Codex provider wire_api must be responses")
     key = provider.get("env_key")
     if key and not env.get(key):
         raise RuntimeError(f"export {key}; the verifier never copies global credential stores")
     if provider.get("requires_openai_auth", not provider) and not env.get("CODEX_API_KEY"):
         raise RuntimeError("export CODEX_API_KEY; the verifier never copies global credential stores")
-    for path in [config_path, *source.glob("*.config.toml")]:
-        destination = target / path.name
-        shutil.copyfile(path, destination)
-        destination.chmod(0o600)
+    destination = target / "config.toml"
+    destination.write_text(config_text)
+    destination.chmod(0o600)
     env["CODEX_HOME"] = str(target)
 
 
 def verify(root, source, env, timeout, report):
+    try:
+        isolated_codex_home(root, env)
+    except (OSError, ValueError, RuntimeError) as error:
+        for gate in report.names:
+            report.fail_gate(gate, error)
+        return
+
     repo = root / "repo"
     repo.mkdir()
     scratch = root / "tmp"
@@ -329,14 +361,6 @@ def verify(root, source, env, timeout, report):
     except RuntimeError as error:
         for gate in ("git", "background_process"):
             report.fail_gate(gate, error)
-
-    try:
-        isolated_codex_home(root, env)
-    except (OSError, ValueError, RuntimeError) as error:
-        for gate in ("shell", "filesystem", "exec_jsonl", "session_resume", "agents_md",
-                     "sandbox_read_only", "code_review", "search_mcp", "playwright_mcp"):
-            report.fail_gate(gate, error)
-        return
 
     def execute(prompt, **kwargs):
         return codex_exec(prompt, repo, env, timeout, **kwargs)

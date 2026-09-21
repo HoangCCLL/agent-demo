@@ -28,7 +28,8 @@ RAG_CORPUS_PATH=
 ```
 
 Replace both placeholder secrets with random values; distribute the MCP token
-only to approved client operators. Then run:
+only to approved client operators. Apply the upstream firewall policy in
+section 2 before starting the stack, then run:
 
 ```bash
 bash scripts/setup.sh
@@ -36,50 +37,49 @@ bash scripts/setup.sh
 
 Accept the service host only when its final marker is `PHASE11_LOCAL_READY`.
 
-## 2. Restrict the service VPS firewall
+## 2. Restrict access with an upstream firewall
 
-Before changing UFW on a remote VPS, preserve and test its SSH/management
-access from a second session. Inspect the current firewall:
+An upstream firewall is mandatory: use a router, hypervisor firewall, VLAN
+access-control policy, or security appliance on the actual path to the service
+VPS. For destination `LAN_IP` (`192.0.2.20` in this example), allow TCP `18081`
+and `18082` only from the approved Codex client IPs, and deny those destination
+ports from every other source. Remove conflicting broad allows for these ports
+after reviewing the existing policy. Preserve and test SSH/management access
+from a second session before changing any policy.
 
-```bash
-sudo ufw status verbose
-sudo ufw status numbered
-```
+The enforcement point must also filter traffic from unapproved hosts on the
+same LAN; a router policy does not help if those hosts can reach the VPS
+directly on the same Layer 2 network. Use an enforced VLAN boundary or
+hypervisor filtering when necessary.
 
-Continue only when UFW is `active` and its default incoming policy is `deny`.
-Do not blindly change the default policy on a remote host; if this prerequisite
-is not already met, stop and have the host firewall policy reviewed first.
+Ordinary UFW `INPUT` rules are insufficient for Docker-published ports. Docker
+diverts published traffic before those rules apply; see Docker's official
+[Docker and UFW firewall note](https://docs.docker.com/engine/network/packet-filtering-firewalls/#docker-and-ufw).
 
-In the numbered output, inspect every existing rule for TCP `18081` and
-`18082`. Remove only pre-existing broad/public MCP allows after confirming the
-rule number and that it is not needed; numbers change after every deletion, so
-re-run the inspection before each removal:
+The rendered Compose configuration must publish only Search MCP on `18081`
+and the Playwright authentication proxy on `18082`, bound to the explicit LAN
+IP. SearXNG, Playwright itself, and `test-site` remain Docker-internal.
 
-```bash
-sudo ufw delete <confirmed-rule-number>
-sudo ufw status numbered
-```
-
-Then allow the published authenticated proxy ports only from each approved
-Codex client IP. For a client at `192.0.2.31`:
-
-```bash
-sudo ufw allow from 192.0.2.31 to 192.0.2.20 port 18081 proto tcp
-sudo ufw allow from 192.0.2.31 to 192.0.2.20 port 18082 proto tcp
-```
-
-Repeat those two rules for every approved client IP; do not add a broad
-subnet/public allow rule. Verify the final rules:
+After starting the stack, run the authenticated verifier from each approved
+client using its environment file from section 3:
 
 ```bash
-sudo ufw status numbered
+bash scripts/verify_remote_mcp.sh .env.client
 ```
 
-The only final rules for ports `18081` and `18082` must be per-client,
-source-specific TCP allows; retain the separate SSH/management rules. The
-rendered Compose configuration must publish only Search MCP on `18081` and the
-Playwright authentication proxy on `18082`. SearXNG, Playwright itself, and
-`test-site` remain Docker-internal.
+Require `REMOTE_MCP_READY`. While the services remain running, test both
+ports from an unapproved LAN client (no token is needed):
+
+```bash
+nc -vz -w 5 192.0.2.20 18081
+nc -vz -w 5 192.0.2.20 18082
+```
+
+Both TCP connections must fail or time out with nonzero exit status. A
+successful TCP connection, including one followed by HTTP `401`, fails this
+network acceptance check. Record the source IPs and results for both the
+approved and unapproved clients; do not accept the deployment without both.
+Ensure `nc` is installed; a command-not-found error is not a passing result.
 
 Plain HTTP with a bearer token is permitted only on an isolated demo LAN. Use
 TLS or a trusted encrypted WireGuard/Tailscale overlay before crossing an
@@ -125,6 +125,19 @@ required = true
 startup_timeout_sec = 30
 tool_timeout_sec = 120
 ```
+
+The final verifier copies only the base `config.toml` into an isolated Codex
+home. Its top-level `model` must equal `LLM_MODEL`, and `model_provider` must
+select an existing `[model_providers.<name>]` table whose `base_url` matches
+`LLM_BASE_URL` (scheme/host case, default ports, and trailing slashes are
+normalized). The provider must use `wire_api = "responses"`, the default when
+omitted. If `review_model` is set, it must also equal `LLM_MODEL`.
+
+This verifier does not select a profile: put the settings being tested in the
+base configuration and remove any top-level `profile` selection. A mismatch
+stops verification before model calls or capability passes. Export any required
+provider key through its configured `env_key` (or `CODEX_API_KEY` when required);
+the verifier never reads or copies credential stores such as `auth.json`.
 
 Before starting a new Codex session, export the same token:
 

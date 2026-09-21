@@ -1,8 +1,10 @@
 import contextlib
 import io
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import verify_codex_vps as verifier
 from verify_codex_vps import (
@@ -12,6 +14,100 @@ from verify_codex_vps import (
 
 
 class CodexVpsVerifierTest(unittest.TestCase):
+    def test_nested_tool_payload_cannot_impersonate_completed_playwright_item(self):
+        fake = {"type": "mcp_tool_call", "server": "playwright", "tool": "browser_navigate",
+                "result": {"content": [{"text": "JS_READY"}]}}
+        for container in ("arguments", "result", "content", "payload"):
+            actual = {"type": "mcp_tool_call", "server": "other", "tool": "browser_navigate",
+                      container: {"item": fake}}
+            events = [
+                {"type": "thread.started"},
+                {"type": "item.completed", "payload": {"item": actual}},
+                {"type": "item.completed", "item": {"type": "agent_message", "text": "PLAYWRIGHT_MCP_OK"}},
+                {"type": "turn.completed"},
+            ]
+            with self.subTest(container=container), self.assertRaises(RuntimeError):
+                require_mcp(events, "browser_navigate", "PLAYWRIGHT_MCP_OK", "JS_READY", server="playwright")
+
+    def test_completed_items_traverse_event_wrappers_only(self):
+        item = {"type": "mcp_tool_call", "server": "playwright", "tool": "browser_navigate"}
+        for wrapper in ({"item": item}, {"payload": {"item": item}}, {"data": [{"payload": {"item": item}}]}):
+            self.assertEqual(verifier.completed_items([{"type": "item.completed", **wrapper}], "mcp_tool_call"), [item])
+        for container in ("arguments", "result", "content", "unrecognized"):
+            with self.subTest(container=container):
+                self.assertEqual(verifier.completed_items([
+                    {"type": "item.completed", container: {"item": item}},
+                ], "mcp_tool_call"), [])
+
+    def test_review_command_keeps_prompt_without_conflicting_uncommitted_flag(self):
+        prompt = "Review the uncommitted change in divide.py and identify the division-by-zero risk."
+        with patch.object(verifier.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as process:
+            verifier.codex_exec(prompt, Path("."), {}, 10, review=True)
+        command = process.call_args.args[0]
+        self.assertIn("review", command)
+        self.assertIn("--json", command)
+        self.assertNotIn("--uncommitted", command)
+        self.assertEqual(command[-1], prompt + verifier.SAFE_PROMPT)
+
+    def test_isolated_home_requires_same_model_and_responses_provider(self):
+        base = ('model="demo-model"\nmodel_provider="demo"\n'
+                '[model_providers.demo]\nbase_url="http://llm:1235/v1"\nwire_api="responses"\n')
+        cases = (
+            ("exact match", base, True),
+            ("normalized URL", base.replace("http://llm:1235/v1", "HTTP://LLM:1235/v1/"), True),
+            ("wrong port", base.replace("http://llm:1235/v1", "http://llm:80/v1/"), False),
+            ("wrong model", base.replace('model="demo-model"', 'model="other"'), False),
+            ("missing model", base.replace('model="demo-model"\n', ''), False),
+            ("wrong URL", base.replace("http://llm:1235/v1", "http://other:1235/v1"), False),
+            ("wrong path", base.replace("/v1", "/v2"), False),
+            ("missing provider", base.replace('model_provider="demo"', 'model_provider="missing"'), False),
+            ("missing URL", base.replace('base_url="http://llm:1235/v1"\n', ''), False),
+            ("invalid URL", base.replace("http://llm:1235/v1", "llm/v1"), False),
+            ("non-Responses", base.replace('wire_api="responses"', 'wire_api="chat"'), False),
+            ("selected profile", 'profile="other"\n' + base, False),
+            ("different review model", 'review_model="other"\n' + base, False),
+        )
+        for label, config, accepted in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source = root / "source"
+                source.mkdir()
+                (source / "config.toml").write_text(config)
+                env = {"CODEX_HOME": str(source), "LLM_MODEL": "demo-model",
+                       "LLM_BASE_URL": "http://llm:1235/v1", "CODEX_API_KEY": "test-only"}
+                if accepted:
+                    isolated_codex_home(root, env)
+                    self.assertEqual((Path(env["CODEX_HOME"]) / "config.toml").read_text(), config)
+                else:
+                    with self.assertRaises(RuntimeError):
+                        isolated_codex_home(root, env)
+
+    def test_isolated_home_normalizes_default_ports_and_trailing_slashes(self):
+        for provider_url, checked_url in (("HTTP://LLM:80/v1/", "http://llm/v1"),
+                                          ("https://LLM/v1", "https://llm:443/v1/")):
+            with self.subTest(provider_url=provider_url), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "config.toml").write_text('model="demo-model"\nmodel_provider="demo"\n'
+                    f'[model_providers.demo]\nbase_url="{provider_url}"\nwire_api="responses"\n')
+                env = {"CODEX_HOME": str(root), "LLM_MODEL": "demo-model", "LLM_BASE_URL": checked_url}
+                isolated_codex_home(root, env)
+                self.assertTrue((Path(env["CODEX_HOME"]) / "config.toml").is_file())
+
+    def test_provider_mismatch_fails_before_any_model_driven_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            (source / "config.toml").write_text('model="other"\nmodel_provider="demo"\n'
+                '[model_providers.demo]\nbase_url="http://llm:1235/v1"\nwire_api="responses"\n')
+            env = {"CODEX_HOME": str(source), "LLM_MODEL": "demo-model", "LLM_BASE_URL": "http://llm:1235/v1"}
+            report = GateReport()
+            with patch.object(verifier.subprocess, "run", side_effect=AssertionError("subprocess started before identity check")):
+                verifier.verify(root, Path(__file__).parent, env, 10, report)
+            self.assertFalse(report.passed)
+            self.assertEqual(set(report.failures), set(report.names))
+            self.assertFalse(report.ready())
+
     def test_playwright_requires_returned_content_not_arguments(self):
         events = [
             {"type": "thread.started"},
@@ -194,14 +290,18 @@ class CodexVpsVerifierTest(unittest.TestCase):
             root = Path(directory)
             existing = root / "existing"
             existing.mkdir()
-            (existing / "config.toml").write_text('model_provider="demo"\n[model_providers.demo]\nenv_key="DEMO_KEY"\n')
+            (existing / "config.toml").write_text('model="demo-model"\nmodel_provider="demo"\n'
+                '[model_providers.demo]\nbase_url="http://llm:1235/v1"\nwire_api="responses"\nenv_key="DEMO_KEY"\n')
             (existing / "auth.json").write_text('{"secret":"must-not-copy"}')
+            (existing / "other.config.toml").write_text('model="unselected"\n')
             isolated = root / "isolated"
             isolated.mkdir()
-            env = {"CODEX_HOME": str(existing), "DEMO_KEY": "exported"}
+            env = {"CODEX_HOME": str(existing), "DEMO_KEY": "exported",
+                   "LLM_MODEL": "demo-model", "LLM_BASE_URL": "http://llm:1235/v1"}
             isolated_codex_home(isolated, env)
             copied = Path(env["CODEX_HOME"])
             self.assertFalse((copied / "auth.json").exists())
+            self.assertFalse((copied / "other.config.toml").exists())
             self.assertEqual((copied / "config.toml").read_bytes(), (existing / "config.toml").read_bytes())
             self.assertEqual(copied.stat().st_mode & 0o777, 0o700)
             self.assertEqual((copied / "config.toml").stat().st_mode & 0o777, 0o600)
