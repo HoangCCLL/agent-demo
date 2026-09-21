@@ -7,3 +7,9 @@
 5. Provide one setup command and one aggregate verification command.
 6. Defer Codex CLI installation and final cross-VPS integration to the target VPS.
 
+## Phase 1.1 status
+
+MCP services are shared once over the LAN from the service VPS; Codex CLI
+remains the client-only final integration step on each Codex VPS. See the
+[Phase 1.1 design](../superpowers/specs/2026-09-21-phase11-native-parity-design.md)
+and the [LAN deployment runbook](../phase11-runbook.md).
