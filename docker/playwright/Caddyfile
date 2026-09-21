@@ -1,0 +1,15 @@
+:8080 {
+    handle /health {
+        respond "ok" 200
+    }
+
+    @authorized header Authorization "Bearer {$MCP_AUTH_TOKEN}"
+    handle @authorized {
+        reverse_proxy playwright:8931 {
+            header_up Host playwright:8931
+        }
+    }
+
+    respond "unauthorized" 401
+}
+

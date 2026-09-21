@@ -1,0 +1,128 @@
+name: codex-phase1
+
+services:
+  searxng:
+    image: ghcr.io/searxng/searxng:2026.9.11-61d660276
+    restart: unless-stopped
+    environment:
+      SEARXNG_SECRET: ${SEARXNG_SECRET:?Run scripts/setup.sh first}
+      SEARXNG_BASE_URL: http://searxng:8080/
+      SEARXNG_BIND_ADDRESS: 0.0.0.0
+      SEARXNG_PORT: "8080"
+      SEARXNG_LIMITER: "false"
+    volumes:
+      - ./docker/searxng/settings.yml:/etc/searxng/settings.yml:ro
+      - searxng-cache:/var/cache/searxng
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETGID, SETUID, DAC_OVERRIDE]
+    mem_limit: 768m
+    cpus: 1.0
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=5).read()"]
+      interval: 10s
+      timeout: 6s
+      retries: 12
+
+  search-mcp:
+    image: isokoliuk/mcp-searxng:2.3.0
+    restart: unless-stopped
+    depends_on:
+      searxng:
+        condition: service_healthy
+    environment:
+      SEARXNG_URL: http://searxng:8080
+      SEARXNG_MAX_RESULTS: "10"
+      SEARXNG_MAX_RESULT_CHARS: "500"
+      URL_READ_MAX_CHARS: "20000"
+      MCP_HTTP_PORT: "8080"
+      MCP_HTTP_HOST: 0.0.0.0
+      MCP_HTTP_STATELESS: "false"
+      MCP_HTTP_HARDEN: "true"
+      MCP_HTTP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:?Run scripts/setup.sh first}
+      MCP_HTTP_ALLOWED_HOSTS: ${SEARCH_MCP_ALLOWED_HOSTS:-127.0.0.1:18081,localhost:18081}
+      MCP_HTTP_ALLOWED_ORIGINS: http://127.0.0.1:${SEARCH_MCP_PORT:-18081}
+    ports:
+      - "${MCP_BIND_ADDRESS:-127.0.0.1}:${SEARCH_MCP_PORT:-18081}:8080"
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    mem_limit: 512m
+    cpus: 1.0
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 6s
+      retries: 12
+
+  playwright:
+    image: mcr.microsoft.com/playwright/mcp:v0.0.82
+    restart: unless-stopped
+    init: true
+    entrypoint: [node]
+    command:
+      - /app/cli.js
+      - --headless
+      - --browser=chromium
+      - --no-sandbox
+      - --isolated
+      - --port=8931
+      - --host=0.0.0.0
+      - --allowed-hosts=*
+      - --block-service-workers
+      - --idle-timeout=300000
+      - --output-dir=/tmp/playwright-output
+      - --output-max-size=10485760
+      - --codegen=none
+    shm_size: 1gb
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m
+      - /home/node:size=64m,uid=1000,gid=1000
+    cap_drop: [ALL]
+    mem_limit: 1536m
+    cpus: 2.0
+
+  playwright-proxy:
+    image: caddy:2.10.2-alpine
+    restart: unless-stopped
+    depends_on: [playwright]
+    environment:
+      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:?Run scripts/setup.sh first}
+    volumes:
+      - ./docker/playwright/Caddyfile:/etc/caddy/Caddyfile:ro
+    ports:
+      - "${MCP_BIND_ADDRESS:-127.0.0.1}:${PLAYWRIGHT_MCP_PORT:-18082}:8080"
+    read_only: true
+    tmpfs: [/config, /data]
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    mem_limit: 128m
+    cpus: 0.5
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, http://127.0.0.1:8080/health]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  test-site:
+    image: nginx:1.29-alpine
+    restart: unless-stopped
+    volumes:
+      - ./docker/test-site:/usr/share/nginx/html:ro
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+      - /tmp
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETGID, SETUID]
+    mem_limit: 64m
+    cpus: 0.25
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, http://127.0.0.1/]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  searxng-cache:

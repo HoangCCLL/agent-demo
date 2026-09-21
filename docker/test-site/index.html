@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>MCP Demo</title></head>
+  <body>
+    <h1>MCP Demo</h1>
+    <p id="dynamic">Loading…</p>
+    <label for="name">Name</label>
+    <input id="name" name="name">
+    <button id="submit" type="button">Submit</button>
+    <p id="result" role="status"></p>
+    <a id="download" href="/fixture.txt" download>Download fixture</a>
+    <script>
+      document.querySelector('#dynamic').textContent = 'JS_READY';
+      document.querySelector('#submit').addEventListener('click', () => {
+        document.querySelector('#result').textContent = `Hello ${document.querySelector('#name').value}`;
+      });
+    </script>
+  </body>
+</html>
+
