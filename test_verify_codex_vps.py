@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import verify_codex_vps as verifier
 from verify_codex_vps import (
     CRITICAL_GATES, GateReport, isolated_codex_home, load_env, parse_jsonl,
     require_command, require_mcp, require_turn,
@@ -11,6 +12,78 @@ from verify_codex_vps import (
 
 
 class CodexVpsVerifierTest(unittest.TestCase):
+    def test_playwright_requires_returned_content_not_arguments(self):
+        events = [
+            {"type": "thread.started"},
+            {"type": "item.completed", "item": {"type": "mcp_tool_call", "server": "playwright",
+                "tool": "browser_navigate", "result": {"content": [{"text": "loaded"}]}}},
+            {"type": "item.completed", "payload": {"item": {"type": "mcp_tool_call", "server": "playwright",
+                "tool": "browser_evaluate", "arguments": {"function": "() => text === 'JS_READY'"},
+                "result": {"content": [{"text": "false"}]}}}},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "PLAYWRIGHT_MCP_OK"}},
+            {"type": "turn.completed"},
+        ]
+        with self.assertRaises(RuntimeError):
+            require_mcp(events, "browser_navigate", "PLAYWRIGHT_MCP_OK", "JS_READY")
+        events[2]["payload"]["item"]["result"]["content"][0]["text"] = "JS_READY"
+        require_mcp(events, "browser_navigate", "PLAYWRIGHT_MCP_OK", "JS_READY")
+
+    def test_mcp_requires_selected_server_for_tool_and_returned_content(self):
+        events = [
+            {"type": "thread.started"},
+            {"type": "item.completed", "item": {"type": "mcp_tool_call", "server": "other",
+                "tool": "browser_navigate", "arguments": {"server": "playwright"},
+                "result": {"content": [{"text": "JS_READY"}]}}},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "PLAYWRIGHT_MCP_OK"}},
+            {"type": "turn.completed"},
+        ]
+        with self.assertRaises(RuntimeError):
+            require_mcp(events, "browser_navigate", "PLAYWRIGHT_MCP_OK", "JS_READY", server="playwright")
+        events[1]["item"]["server"] = "playwright"
+        require_mcp(events, "browser_navigate", "PLAYWRIGHT_MCP_OK", "JS_READY", server="playwright")
+        events.insert(2, {"type": "item.completed", "item": {"type": "mcp_tool_call", "server": "other",
+            "tool": "browser_evaluate", "result": {"content": [{"text": "JS_READY"}]}}})
+        events[1]["item"]["result"] = {"content": [{"text": "loaded"}]}
+        with self.assertRaises(RuntimeError):
+            require_mcp(events, "browser_navigate", "PLAYWRIGHT_MCP_OK", "JS_READY", server="playwright")
+
+    def test_mcp_config_must_match_checked_endpoint_and_token(self):
+        config = {"name": "web_search", "enabled": True, "transport": {
+            "type": "streamable_http", "url": "http://lan:18081/mcp",
+            "bearer_token_env_var": "MCP_AUTH_TOKEN",
+        }}
+        verifier.require_mcp_config(config, "web_search", "http://lan:18081/mcp", {"MCP_AUTH_TOKEN": "token"})
+        for key, value in (("url", "http://other:18081/mcp"), ("bearer_token_env_var", "OTHER_TOKEN"),
+                           ("type", "stdio"), ("http_headers", {"Authorization": "Bearer wrong"})):
+            changed = {**config, "transport": {**config["transport"], key: value}}
+            with self.subTest(key=key), self.assertRaises(RuntimeError):
+                verifier.require_mcp_config(changed, "web_search", "http://lan:18081/mcp", {"MCP_AUTH_TOKEN": "token"})
+        for changed in ({**config, "name": "other"}, {**config, "enabled": False}):
+            with self.assertRaises(RuntimeError):
+                verifier.require_mcp_config(changed, "web_search", "http://lan:18081/mcp", {"MCP_AUTH_TOKEN": "token"})
+        with self.assertRaises(RuntimeError):
+            verifier.require_mcp_config(config, "web_search", "http://lan:18081/mcp", {})
+
+    def test_sandbox_requires_exact_failed_write_with_denial_output(self):
+        item = {"type": "command_execution", "command": "touch blocked.txt", "exit_code": 1,
+                "aggregated_output": "touch: cannot touch 'blocked.txt': Permission denied"}
+        events = [{"type": "item.completed", "payload": {"item": item}}]
+        verifier.require_sandbox_denial(events)
+        for command in ("echo 'touch blocked.txt'", "touch blocked.txt; rm blocked.txt",
+                        "touch blocked.txt && rm blocked.txt"):
+            item["command"] = command
+            with self.subTest(command=command), self.assertRaises(RuntimeError):
+                verifier.require_sandbox_denial(events)
+        item["command"] = "/bin/bash -lc 'touch blocked.txt'"
+        verifier.require_sandbox_denial(events)
+        item["exit_code"] = 0
+        with self.assertRaises(RuntimeError):
+            verifier.require_sandbox_denial(events)
+        item["exit_code"] = 1
+        item["aggregated_output"] = "touch: command not found"
+        with self.assertRaises(RuntimeError):
+            verifier.require_sandbox_denial(events)
+
     def test_parses_jsonl_and_rejects_invalid_lines(self):
         events = parse_jsonl('{"type":"thread.started","thread_id":"abc"}\n')
         self.assertEqual(events[0]["thread_id"], "abc")

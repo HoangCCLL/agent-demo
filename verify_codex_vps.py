@@ -6,6 +6,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import subprocess
 import sys
@@ -83,8 +84,30 @@ def contains(value, marker):
 
 
 def completed_items(events, kind):
-    return [event for event in events
-            if event.get("type") == "item.completed" and kind in values(event)]
+    def objects(value):
+        if isinstance(value, dict):
+            yield value
+            for child in value.values():
+                yield from objects(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from objects(child)
+
+    return [item for event in events if event.get("type") == "item.completed"
+            for item in objects(event) if item.get("type") == kind]
+
+
+def fields(value, name):
+    """Find named evidence through wrappers, without reading tool arguments/results as metadata."""
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == name:
+                yield child
+            elif key not in ("arguments", "result"):
+                yield from fields(child, name)
+    elif isinstance(value, list):
+        for child in value:
+            yield from fields(child, name)
 
 
 def has_field(value, key, expected):
@@ -112,16 +135,50 @@ def require_turn(events, marker=None):
         raise RuntimeError(f"final agent message missing {marker}")
 
 
-def require_mcp(events, tool, marker, result_marker=None):
+def require_mcp(events, tool, marker, result_marker=None, *, server=None):
     require_turn(events, marker)
     items = completed_items(events, "mcp_tool_call")
-    successful = [item for item in items if not has_field(item, "isError", True) and not any(
+    successful = [item for item in items if (server is None or server in fields(item, "server"))
+                  and not has_field(item, "isError", True) and not any(
         part in ("failed", "error") for part in values(item)
     )]
-    if not any(contains(item, tool) for item in successful):
+    if not any(tool in fields(item, "tool") or tool in fields(item, "name") for item in successful):
         raise RuntimeError(f"no completed MCP call to {tool}")
-    if result_marker and not any(contains(item, result_marker) for item in successful):
+    if result_marker and not any(contains(result, result_marker)
+                                 for item in successful for result in fields(item, "result")):
         raise RuntimeError(f"MCP output missing {result_marker}")
+
+
+def require_mcp_config(config, name, url, env):
+    transport = config.get("transport", {})
+    if config.get("name") != name or config.get("enabled") is False:
+        raise RuntimeError(f"MCP server {name} is missing or disabled")
+    if transport.get("type") != "streamable_http" or transport.get("url") != url:
+        raise RuntimeError(f"MCP server {name} does not use the checked LAN endpoint")
+    if transport.get("bearer_token_env_var") != "MCP_AUTH_TOKEN" or not env.get("MCP_AUTH_TOKEN"):
+        raise RuntimeError(f"MCP server {name} must use the exported MCP_AUTH_TOKEN")
+    for key in ("http_headers", "env_http_headers"):
+        if any(header.lower() == "authorization" for header in (transport.get(key) or {})):
+            raise RuntimeError(f"MCP server {name} overrides bearer authentication through {key}")
+
+
+def require_sandbox_denial(events):
+    for item in completed_items(events, "command_execution"):
+        command = item.get("command", "")
+        try:
+            parts = shlex.split(command)
+            if len(parts) == 3 and Path(parts[0]).name in ("bash", "sh", "zsh") and parts[1] in ("-c", "-lc"):
+                parts = shlex.split(parts[2])
+        except ValueError:
+            continue
+        if parts != ["touch", "blocked.txt"]:
+            continue
+        code = item.get("exit_code")
+        output = item.get("aggregated_output", "").lower()
+        if (type(code) is int and code != 0 and "blocked.txt" in output
+                and any(reason in output for reason in ("permission denied", "read-only file system", "operation not permitted"))):
+            return
+    raise RuntimeError("missing actual touch blocked.txt failure with sandbox permission-denial output")
 
 
 def load_env(path, env):
@@ -324,10 +381,10 @@ def verify(root, source, env, timeout, report):
         blocked = repo / "blocked.txt"
         if blocked.exists() or blocked.is_symlink():
             raise RuntimeError("blocked.txt already exists before sandbox check")
-        events = execute("You must attempt to run touch blocked.txt, then report the result.")
+        events = execute("You must attempt to run exactly touch blocked.txt as a standalone command, then report the result. "
+                         "Do not echo, simulate, wrap with other commands, or remove the file.")
         require_turn(events)
-        if not any(contains(item, "touch blocked.txt") for item in completed_items(events, "command_execution")):
-            raise RuntimeError("missing attempted touch command")
+        require_sandbox_denial(events)
         if blocked.exists() or blocked.is_symlink():
             raise RuntimeError("read-only sandbox allowed blocked.txt to persist")
 
@@ -358,10 +415,12 @@ def verify(root, source, env, timeout, report):
     ):
         def mcp_check():
             name = env.get(name_key, default)
-            command(["codex", "mcp", "get", name, "--json"])
+            config = json.loads(command(["codex", "mcp", "get", name, "--json"]).stdout)
+            url_key = "SEARCH_MCP_URL" if gate == "search_mcp" else "PLAYWRIGHT_MCP_URL"
+            require_mcp_config(config, name, env.get(url_key), env)
             if not protocol.get(gate):
                 raise RuntimeError(report.failures.get(gate, "MCP protocol prerequisite failed"))
-            require_mcp(execute(prompt.format(name=name)), tool, marker, result_marker)
+            require_mcp(execute(prompt.format(name=name)), tool, marker, result_marker, server=name)
         attempt((gate,), mcp_check)
 
 
