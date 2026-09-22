@@ -1,5 +1,6 @@
 import contextlib
 import io
+import json
 import subprocess
 import tempfile
 import unittest
@@ -49,6 +50,16 @@ class CodexVpsVerifierTest(unittest.TestCase):
         self.assertNotIn("--uncommitted", command)
         self.assertEqual(command[-1], prompt + verifier.SAFE_PROMPT)
 
+    def test_codex_commands_select_configured_profile(self):
+        env = {"CODEX_PROFILE": "openweight"}
+        self.assertEqual(
+            verifier.codex_command(env, "mcp", "get", "web_search", "--json"),
+            ["codex", "-p", "openweight", "mcp", "get", "web_search", "--json"],
+        )
+        with patch.object(verifier.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as process:
+            verifier.codex_exec("Reply OK", Path("."), env, 10)
+        self.assertEqual(process.call_args.args[0][:4], ["codex", "-p", "openweight", "exec"])
+
     def test_isolated_home_requires_same_model_and_responses_provider(self):
         base = ('model="demo-model"\nmodel_provider="demo"\n'
                 '[model_providers.demo]\nbase_url="http://llm:1235/v1"\nwire_api="responses"\n')
@@ -93,6 +104,22 @@ class CodexVpsVerifierTest(unittest.TestCase):
                 isolated_codex_home(root, env)
                 self.assertTrue((Path(env["CODEX_HOME"]) / "config.toml").is_file())
 
+    def test_preflight_uses_selected_provider_authentication(self):
+        cases = (
+            ('requires_openai_auth=true\n', "CODEX_API_KEY"),
+            ('requires_openai_auth=true\nenv_key="CUSTOM_KEY"\n', "CUSTOM_KEY"),
+            ('requires_openai_auth=false\n', "LLM_API_KEY"),
+        )
+        for settings, expected in cases:
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "config.toml").write_text('model="demo"\nmodel_provider="lan"\n'
+                    '[model_providers.lan]\nbase_url="http://llm/v1"\n' + settings)
+                env = {"CODEX_HOME": str(root), "LLM_MODEL": "demo", "LLM_BASE_URL": "http://llm/v1",
+                       "CODEX_API_KEY": "codex-test", "CUSTOM_KEY": "custom-test", "LLM_API_KEY": "lan-test"}
+                isolated_codex_home(root, env)
+                self.assertEqual(env["_HARNESS_API_KEY_ENV"], expected)
+
     def test_provider_mismatch_fails_before_any_model_driven_gate(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -106,6 +133,34 @@ class CodexVpsVerifierTest(unittest.TestCase):
                 verifier.verify(root, Path(__file__).parent, env, 10, report)
             self.assertFalse(report.passed)
             self.assertEqual(set(report.failures), set(report.names))
+            self.assertFalse(report.ready())
+
+    def test_namespace_failure_stops_before_mcp_and_agent_turns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "config.toml").write_text('model="qwen/test"\nmodel_provider="lan"\n'
+                '[model_providers.lan]\nname="LAN"\nbase_url="http://llm/v1"\nenv_key="LLM_API_KEY"\n')
+            env = {"CODEX_HOME": str(root), "LLM_MODEL": "qwen/test", "LLM_BASE_URL": "http://llm/v1",
+                   "LLM_API_KEY": "test-secret"}
+            commands = []
+
+            def execute(args, *unused):
+                commands.append(args)
+                if Path(args[0]).name == "git":
+                    return subprocess.CompletedProcess(args, 0, "", "")
+                self.assertEqual(Path(args[1]).name, "check_codex_api.py")
+                self.assertIn("--check-namespaces", args)
+                self.assertEqual(args[args.index("--api-key-env") + 1], "LLM_API_KEY")
+                return subprocess.CompletedProcess(args, 1,
+                    "PASS  Responses API\nPASS  Responses streaming\n"
+                    "FAIL  namespaced function calling: unsupported namespace\nINCOMPATIBLE\n", "")
+
+            report = GateReport()
+            with patch.object(verifier, "run", side_effect=execute), contextlib.redirect_stdout(io.StringIO()):
+                verifier.verify(root, Path(__file__).parent, env, 10, report)
+            self.assertEqual(report.passed, {"responses", "streaming"})
+            self.assertIn("function_calling", report.failures)
+            self.assertFalse(any(args[0] == "codex" for args in commands))
             self.assertFalse(report.ready())
 
     def test_playwright_requires_returned_content_not_arguments(self):
@@ -196,6 +251,12 @@ class CodexVpsVerifierTest(unittest.TestCase):
         for name in report.names:
             if name != next(iter(CRITICAL_GATES)):
                 report.pass_gate(name)
+        self.assertFalse(report.ready())
+
+    def test_nineteen_gates_without_sandbox_cannot_be_ready(self):
+        report = GateReport()
+        report.passed.update(set(report.names) - {"sandbox_read_only"})
+        self.assertEqual(len(report.passed), 19)
         self.assertFalse(report.ready())
 
     def test_score_deduplicates_and_rejects_unknown_gates(self):
@@ -305,6 +366,62 @@ class CodexVpsVerifierTest(unittest.TestCase):
             self.assertEqual((copied / "config.toml").read_bytes(), (existing / "config.toml").read_bytes())
             self.assertEqual(copied.stat().st_mode & 0o777, 0o700)
             self.assertEqual((copied / "config.toml").stat().st_mode & 0o777, 0o600)
+
+    def test_isolated_home_uses_opt_in_profile_without_changing_openai_base(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            existing = root / "existing"
+            existing.mkdir()
+            base = '# OpenAI default remains selected by plain codex\n'
+            profile = ('model="demo-model"\nmodel_provider="openweight_lan"\n'
+                       '[model_providers.openweight_lan]\nbase_url="http://llm:1235/v1"\n'
+                       'wire_api="responses"\nrequires_openai_auth=false\n')
+            (existing / "config.toml").write_text(base)
+            (existing / "openweight.config.toml").write_text(profile)
+            (existing / "auth.json").write_text('{"secret":"must-not-copy"}')
+            env = {"CODEX_HOME": str(existing), "CODEX_PROFILE": "openweight",
+                   "LLM_MODEL": "demo-model", "LLM_BASE_URL": "http://llm:1235/v1"}
+
+            isolated_codex_home(root, env)
+
+            copied = Path(env["CODEX_HOME"])
+            self.assertEqual((copied / "config.toml").read_text(), base)
+            self.assertEqual((copied / "openweight.config.toml").read_text(), profile)
+            self.assertFalse((copied / "auth.json").exists())
+
+    def test_profile_catalog_is_relocated_for_all_codex_commands(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            (source / "config.toml").write_text('model="openai-default"\nmodel_provider="openai"\n')
+            catalog = source / "qwen.json"
+            catalog.write_text(json.dumps({"models": [{"slug": "qwen/test", "context_window": 32768,
+                                                       "input_modalities": ["text", "image"]}]}))
+            profile = ('model="qwen/test"\nmodel_provider="lan"\n'
+                       f'model_catalog_json={json.dumps(str(catalog))}\n'
+                       '[model_providers.lan]\nname="LAN"\nbase_url="http://llm/v1"\n')
+            (source / "lan.config.toml").write_text(profile)
+            env = {"CODEX_HOME": str(source), "CODEX_PROFILE": "lan", "LLM_MODEL": "qwen/test",
+                   "LLM_BASE_URL": "http://llm/v1", "LLM_CONTEXT_WINDOW": "32768", "LLM_SUPPORTS_IMAGE": "true"}
+            isolated_codex_home(root, env)
+            command = verifier.codex_command(env, "debug", "models")
+            override = next(arg for arg in command if arg.startswith("model_catalog_json="))
+            copied = Path(json.loads(override.split("=", 1)[1]))
+            self.assertTrue(copied.is_relative_to(Path(env["CODEX_HOME"])))
+            self.assertEqual(copied.read_bytes(), catalog.read_bytes())
+            self.assertEqual(copied.stat().st_mode & 0o777, 0o600)
+            self.assertEqual((source / "lan.config.toml").read_text(), profile)
+
+    def test_profile_cannot_inherit_a_different_review_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "config.toml").write_text('review_model="openai-review"\n')
+            (root / "lan.config.toml").write_text('model="qwen/test"\nmodel_provider="lan"\n'
+                '[model_providers.lan]\nname="LAN"\nbase_url="http://llm/v1"\n')
+            env = {"CODEX_HOME": str(root), "CODEX_PROFILE": "lan", "LLM_MODEL": "qwen/test", "LLM_BASE_URL": "http://llm/v1"}
+            with self.assertRaisesRegex(RuntimeError, "review_model"):
+                isolated_codex_home(root, env)
 
     def test_dotenv_is_literal_and_existing_environment_wins(self):
         with tempfile.TemporaryDirectory() as directory:

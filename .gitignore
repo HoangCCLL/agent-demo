@@ -1,4 +1,7 @@
 .env
+.env.*
+!.env.example
+!.env.client.example
 artifacts/
 __pycache__/
 .worktrees/

@@ -22,7 +22,7 @@ GATES = (
     "image_input", "background_process", "exec_jsonl", "session_resume",
     "agents_md", "sandbox_read_only", "code_review",
 )
-CRITICAL_GATES = frozenset(GATES[:10])
+CRITICAL_GATES = frozenset((*GATES[:10], "sandbox_read_only"))
 SAFE_PROMPT = " Do not make unrelated changes or modify anything outside this repository."
 
 
@@ -37,7 +37,7 @@ class GateReport:
             raise ValueError(f"unknown gate: {name}")
         if name not in self.passed:
             self.passed.add(name)
-            print(f"PASS  gate {name}")
+            print(f"PASS  gate {name}", flush=True)
 
     def fail_gate(self, name, detail):
         self.failures[name] = " ".join(str(detail).split())
@@ -211,11 +211,20 @@ def run(command, cwd, env, timeout, check=True):
     return result
 
 
+def codex_command(env, *args):
+    profile = env.get("CODEX_PROFILE")
+    if profile and not re.fullmatch(r"[A-Za-z0-9_-]+", profile):
+        raise RuntimeError("CODEX_PROFILE must contain only letters, numbers, underscore, or hyphen")
+    catalog = env.get("_HARNESS_MODEL_CATALOG")
+    return ["codex", *(["-p", profile] if profile else []),
+            *(["-c", "model_catalog_json=" + json.dumps(catalog)] if catalog else []), *args]
+
+
 def codex_exec(prompt, cwd, env, timeout, sandbox="read-only", resume=None, review=False):
-    command = ["codex", "exec", "-s", sandbox, "-c", 'approval_policy="never"',
-               "-c", "sandbox_workspace_write.writable_roots=[]",
-               "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
-               "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true"]
+    command = codex_command(env, "exec", "-s", sandbox, "-c", 'approval_policy="never"',
+                            "-c", "sandbox_workspace_write.writable_roots=[]",
+                            "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
+                            "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true")
     if review:
         command += ["review", "--json", prompt + SAFE_PROMPT]
     elif resume:
@@ -236,19 +245,40 @@ def normalized_base_url(url):
     return parsed.scheme, parsed.hostname, port, parsed.path.rstrip("/")
 
 
+def merged_config(base, overlay):
+    result = dict(base)
+    for key, value in overlay.items():
+        result[key] = (merged_config(result[key], value)
+                       if isinstance(value, dict) and isinstance(result.get(key), dict) else value)
+    return result
+
+
 def isolated_codex_home(root, env):
+    env.pop("_HARNESS_MODEL_CATALOG", None)
     source = Path(env.get("CODEX_HOME", str(Path.home() / ".codex")))
     target = root / "codex-home"
     target.mkdir(mode=0o700)
     config_path = source / "config.toml"
     if not config_path.is_file():
         raise RuntimeError(f"missing {config_path}; configure Codex on this VPS first")
-    config_text = config_path.read_text()
-    config = tomllib.loads(config_text)
-    if config.get("profile"):
-        raise RuntimeError("selected profiles are not verified; configure the base config.toml without profile")
+    base_text = config_path.read_text()
+    base = tomllib.loads(base_text)
+    profile = env.get("CODEX_PROFILE")
+    if profile:
+        codex_command(env)
+        selected_path = source / f"{profile}.config.toml"
+        if not selected_path.is_file():
+            raise RuntimeError(f"missing {selected_path}; install the selected Codex profile first")
+        selected_text = selected_path.read_text()
+        config = merged_config(base, tomllib.loads(selected_text))
+    else:
+        selected_path = None
+        selected_text = base_text
+        config = base
+    if base.get("profile") or config.get("profile"):
+        raise RuntimeError("top-level profile selection is unsupported; use CODEX_PROFILE")
     if not env.get("LLM_MODEL") or config.get("model") != env["LLM_MODEL"]:
-        raise RuntimeError("Codex model must equal LLM_MODEL in the base config.toml")
+        raise RuntimeError("selected Codex model must equal LLM_MODEL")
     if config.get("review_model", config["model"]) != config["model"]:
         raise RuntimeError("Codex review_model must equal LLM_MODEL or be unset")
     provider = config.get("model_providers", {}).get(config.get("model_provider"), {})
@@ -263,10 +293,67 @@ def isolated_codex_home(root, env):
         raise RuntimeError(f"export {key}; the verifier never copies global credential stores")
     if provider.get("requires_openai_auth", not provider) and not env.get("CODEX_API_KEY"):
         raise RuntimeError("export CODEX_API_KEY; the verifier never copies global credential stores")
+    if config.get("model_catalog_json"):
+        catalog_path = Path(config["model_catalog_json"]).expanduser()
+        if not catalog_path.is_absolute():
+            raise RuntimeError("use an absolute model_catalog_json path (rerun the profile installer)")
+        catalog_text = catalog_path.read_text()
+        catalog = json.loads(catalog_text)
+        entries = [entry for entry in catalog.get("models", []) if entry.get("slug") == env["LLM_MODEL"]]
+        if len(entries) != 1:
+            raise RuntimeError("model catalog must contain exactly one entry matching LLM_MODEL")
+        model = entries[0]
+        if env.get("LLM_CONTEXT_WINDOW") and model.get("context_window") != int(env["LLM_CONTEXT_WINDOW"]):
+            raise RuntimeError("catalog context_window must equal LLM_CONTEXT_WINDOW")
+        if env.get("LLM_SUPPORTS_IMAGE"):
+            modalities = ["text", "image"] if env["LLM_SUPPORTS_IMAGE"].lower() == "true" else ["text"]
+            if model.get("input_modalities") != modalities:
+                raise RuntimeError("catalog input_modalities must match LLM_SUPPORTS_IMAGE")
+        copied_catalog = target / "models.json"
+        copied_catalog.write_text(catalog_text)
+        copied_catalog.chmod(0o600)
+        env["_HARNESS_MODEL_CATALOG"] = str(copied_catalog)
+    env["_HARNESS_API_KEY_ENV"] = key or (
+        "CODEX_API_KEY" if provider.get("requires_openai_auth", False) else "LLM_API_KEY")
     destination = target / "config.toml"
-    destination.write_text(config_text)
+    destination.write_text(base_text)
     destination.chmod(0o600)
+    if selected_path:
+        selected_destination = target / selected_path.name
+        selected_destination.write_text(selected_text)
+        selected_destination.chmod(0o600)
     env["CODEX_HOME"] = str(target)
+
+
+def verify_profile_config(cwd, env, timeout):
+    """Parse with the installed Codex binary, without model or MCP calls."""
+    if not env.get("CODEX_PROFILE") or not env.get("_HARNESS_MODEL_CATALOG"):
+        raise RuntimeError("install a catalog-backed profile and select it with --profile or CODEX_PROFILE")
+    print("INFO  " + run(["codex", "--version"], cwd, env, timeout).stdout.strip(), flush=True)
+    # `debug models` accepts a catalog override but rejects --profile on 0.155.1.
+    catalog_env = {key: value for key, value in env.items() if key != "CODEX_PROFILE"}
+    catalog = json.loads(run(codex_command(catalog_env, "debug", "models"), cwd, catalog_env, timeout).stdout)
+    selected = [entry for entry in catalog.get("models", []) if entry.get("slug") == env["LLM_MODEL"]]
+    if len(selected) != 1:
+        raise RuntimeError("installed Codex did not load the selected catalog model")
+    expected = json.loads(Path(env["_HARNESS_MODEL_CATALOG"]).read_text())["models"]
+    expected = next(entry for entry in expected if entry["slug"] == env["LLM_MODEL"])
+    for field in ("context_window", "input_modalities", "tool_mode"):
+        if selected[0].get(field) != expected.get(field):
+            raise RuntimeError(f"installed Codex did not retain catalog {field}; check CLI version")
+    servers = json.loads(run(codex_command(env, "mcp", "list", "--json"), cwd, env, timeout).stdout)
+    for name, key in (("web_search", "SEARCH_MCP_URL"), ("playwright", "PLAYWRIGHT_MCP_URL")):
+        require_mcp_config(next((server for server in servers if server.get("name") == name), {}),
+                           name, env.get(key), env)
+    base_env = {key: value for key, value in env.items()
+                if key not in ("CODEX_PROFILE", "_HARNESS_MODEL_CATALOG")}
+    base = tomllib.loads((Path(env["CODEX_HOME"]) / "config.toml").read_text())
+    if base.get("profile") or base.get("model_provider", "openai") != "openai":
+        raise RuntimeError("plain Codex must use the base OpenAI provider; see migration in the runbook")
+    servers = json.loads(run(["codex", "mcp", "list", "--json"], cwd, base_env, timeout).stdout)
+    if any(server.get("name") in ("web_search", "playwright") for server in servers):
+        raise RuntimeError("LAN MCP entries are active in the base config; move them to the profile")
+    print("CODEX_PROFILE_READY (configuration only; no model or MCP capability claim)", flush=True)
 
 
 def verify(root, source, env, timeout, report):
@@ -287,6 +374,7 @@ def verify(root, source, env, timeout, report):
         return run(args, repo, env, timeout, check)
 
     def attempt(names, action):
+        print("INFO  checking " + ", ".join(names), flush=True)
         try:
             action()
         except Exception as error:
@@ -312,6 +400,26 @@ def verify(root, source, env, timeout, report):
                  ["git", "config", "core.hooksPath", str(scratch)]):
         command(args)
 
+    if env.get("CODEX_PROFILE"):
+        try:
+            verify_profile_config(repo, env, timeout)
+        except Exception as error:
+            for gate in report.names:
+                report.fail_gate(gate, error)
+            return
+
+    provider_args = ["--base-url", env.get("LLM_BASE_URL", ""), "--model", env.get("LLM_MODEL", ""),
+                     "--timeout", str(timeout), "--api-key-env", env["_HARNESS_API_KEY_ENV"]]
+    print("INFO  checking Responses namespace tools before Codex agent turns", flush=True)
+    result = script("check_codex_api.py", provider_args + ["--check-namespaces"], {
+        "PASS Responses API": "responses", "PASS Responses streaming": "streaming",
+        "PASS namespaced function calling": "function_calling",
+        "PASS namespaced tool continuation": "tool_continuation",
+    })
+    if result.returncode:
+        print("FAIL  Codex wire compatibility: " + result.stdout[-2200:], flush=True)
+        return
+
     screenshot = repo / "vision.png"
     vision_marker = "VISION_" + secrets.token_hex(4).upper()
     protocol = {}
@@ -330,13 +438,7 @@ def verify(root, source, env, timeout, report):
         except Exception as error:
             report.fail_gate(gate, error)
 
-    provider_args = ["--base-url", env.get("LLM_BASE_URL", ""), "--model", env.get("LLM_MODEL", ""),
-                     "--timeout", str(timeout)]
     for filename, extra, markers in (
-        ("check_codex_api.py", [], {
-            "PASS Responses API": "responses", "PASS Responses streaming": "streaming",
-            "PASS function calling": "function_calling", "PASS tool continuation": "tool_continuation",
-        }),
         ("verify_model_runtime.py", ["--vision-image", str(screenshot), "--vision-expected", vision_marker], {
             "PASS reasoning response": "reasoning", "PASS long-context smoke": "long_context",
             "PASS concurrency": "concurrency", "PASS stream cancellation": "cancellation",
@@ -439,7 +541,7 @@ def verify(root, source, env, timeout, report):
     ):
         def mcp_check():
             name = env.get(name_key, default)
-            config = json.loads(command(["codex", "mcp", "get", name, "--json"]).stdout)
+            config = json.loads(command(codex_command(env, "mcp", "get", name, "--json")).stdout)
             url_key = "SEARCH_MCP_URL" if gate == "search_mcp" else "PLAYWRIGHT_MCP_URL"
             require_mcp_config(config, name, env.get(url_key), env)
             if not protocol.get(gate):
@@ -451,6 +553,7 @@ def verify(root, source, env, timeout, report):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env-file", type=Path, help="literal KEY=VALUE file; exported values take precedence")
+    parser.add_argument("--profile", help="override CODEX_PROFILE for every Codex subprocess")
     parser.add_argument("--timeout", type=float, default=300, help="timeout in seconds for each subprocess (default: 300)")
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parent, help="harness checkout containing the existing verifiers")
     args = parser.parse_args()
@@ -461,6 +564,8 @@ def main():
         env = os.environ.copy()
         if args.env_file:
             load_env(args.env_file, env)
+        if args.profile:
+            env["CODEX_PROFILE"] = args.profile
         with tempfile.TemporaryDirectory(prefix="codex-vps-") as directory:
             verify(Path(directory), args.repo.resolve(), env, args.timeout, report)
     except Exception as error:

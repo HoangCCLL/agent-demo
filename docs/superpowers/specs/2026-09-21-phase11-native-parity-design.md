@@ -67,6 +67,11 @@ The Docker stack is installed once on the LAN MCP service VPS. A Codex client
 must not install or run copies of these containers. It only needs network
 access, MCP URLs, and the bearer token.
 
+Plain `codex` keeps the user's normal OpenAI configuration. The open-weight
+model and LAN MCP tools live in an opt-in Codex profile selected with
+`codex -p <profile>`. Multiple profile files may select different LAN model
+endpoints while sharing the MCP service.
+
 ## LAN Deployment Contract
 
 The service host binds MCP ports to one explicit LAN interface address. It must
@@ -99,7 +104,23 @@ follow-up work.
 
 ## Codex Client Contract
 
-Each Codex VPS configures remote Streamable HTTP servers:
+Update (2026-09-22): `scripts/install_codex_profile.py` generates the opt-in
+profile plus `catalogs/<profile>.models.json`. It requires explicit serving
+context (`LLM_CONTEXT_WINDOW`) and image capability (`LLM_SUPPORTS_IMAGE`).
+The catalog uses the real `LLM_MODEL` slug, direct tools, and medium reasoning;
+file editing stays available through shell commands. The installer preserves
+the OpenAI base config and refuses differing existing output files.
+
+The observed Codex 0.155.1 wire format nests MCP functions in Responses
+`namespace` tools. The demo endpoint currently rejects this format. Missing
+model metadata was an unproven diagnosis, superseded by an actual namespace
+HTTP 400. The catalog does not resolve that API mismatch. Run
+`check_codex_api.py --check-namespaces` before CLI integration; stop and update
+the backend or use a separately verified compatible CLI before LAN rollout.
+The current operational steps are in `docs/phase11-runbook.md`.
+
+Each Codex VPS configures its open-weight profile with the model provider and
+remote Streamable HTTP servers:
 
 ```toml
 [mcp_servers.web_search]
@@ -115,8 +136,10 @@ startup_timeout_sec = 30
 tool_timeout_sec = 120
 ```
 
-The client exports `MCP_AUTH_TOKEN` before starting a new Codex process. No
-Docker dependency is required on a client VPS for MCP use.
+The client exports `MCP_AUTH_TOKEN` before starting `codex -p <profile>`. MCP
+entries are absent from the base OpenAI config, so plain `codex` does not
+connect to the LAN MCP services. No Docker dependency is required on a client
+VPS for MCP use.
 
 ## Capability Measurement
 
@@ -147,11 +170,12 @@ Additional gates:
 16. `codex exec --json` event stream;
 17. session resume;
 18. `AGENTS.md` instruction application;
-19. read-only sandbox boundary;
+19. read-only sandbox boundary (also mandatory/critical);
 20. code review workflow.
 
 An unsupported image input is reported as a real gap. Phase 1.1 does not hide
 it behind a lower-quality OCR or vision MCP workaround.
+The read-only sandbox gate is mandatory regardless of the numeric score.
 
 ## Verification Flow
 
@@ -184,9 +208,9 @@ resolve `test-site` is expected and is not a deployment failure.
 
 ### Codex CLI integration verification
 
-A separate script is run manually on the client VPS after Codex CLI and its
-configuration are installed. It must not install Codex or mutate global
-configuration automatically.
+A separate script is run manually on the client VPS after Codex CLI and an
+opt-in profile are installed. It must not install Codex or mutate the base
+OpenAI configuration automatically.
 
 The script uses an isolated temporary Git repository and checks:
 
@@ -198,6 +222,12 @@ The script uses an isolated temporary Git repository and checks:
 - failure to persist a requested write in read-only sandbox mode;
 - code review execution;
 - model-driven Search MCP and Playwright MCP tool calls.
+
+It first validates the selected profile and relocated catalog with the installed
+Codex binary, then checks namespaced function calls and continuation. A namespace
+failure stops before agent turns. This gate is additional compatibility evidence,
+not a new scored capability. The catalog is copied to the temporary Codex home
+and selected using a per-command path override; originals stay unchanged.
 
 Expected terminal condition:
 

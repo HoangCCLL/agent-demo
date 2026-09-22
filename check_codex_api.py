@@ -64,6 +64,7 @@ def main():
     parser.add_argument("--model", help="Model ID; defaults to the first model returned")
     parser.add_argument("--timeout", type=float, default=60)
     parser.add_argument("--api-key-env", default="OPENAI_API_KEY")
+    parser.add_argument("--check-namespaces", action="store_true", help="Require namespaced function tools used by current Codex MCP clients")
     args = parser.parse_args()
 
     base_url = args.base_url.rstrip("/")
@@ -142,32 +143,36 @@ def main():
         "max_output_tokens": 256,
     }
 
-    def tool_check():
-        body = post(tool_payload)
+    def tool_check(payload=tool_payload, namespace=None):
+        body = post(payload)
         calls = [item for item in body.get("output", []) if item.get("type") == "function_call"]
         if not calls:
             raise RuntimeError("no function_call in response output")
         call = calls[0]
         if call.get("name") != "add_numbers" or json.loads(call.get("arguments", "{}")) != {"a": 2, "b": 3}:
             raise RuntimeError(f"invalid function call: {call}")
+        if namespace is not None and call.get("namespace") != namespace:
+            raise RuntimeError(f"expected function_call namespace {namespace!r}, got {call.get('namespace')!r}")
         if not body.get("id") or not call.get("call_id"):
             raise RuntimeError("missing response id or call_id")
         return body["id"], call["call_id"]
 
     tool_result = check("function calling", tool_check)
 
-    def continuation_check():
-        response_id, call_id = tool_result
+    def continuation_check(result=tool_result, tools=None):
+        response_id, call_id = result
         body = post({
             "model": model,
             "previous_response_id": response_id,
             "input": [{"type": "function_call_output", "call_id": call_id, "output": "5"}],
-            "tools": [TOOL],
+            "tools": tools if tools is not None else [TOOL],
             "tool_choice": "auto",
             "max_output_tokens": 256,
         })
         if not output_text(body).strip():
             raise RuntimeError("no assistant output after function_call_output")
+        if tools is not None and output_text(body).strip() != "5":
+            raise RuntimeError(f"expected namespaced tool result '5', got {output_text(body)!r}")
         return body
 
     if tool_result:
@@ -182,6 +187,17 @@ def main():
         return post(payload)
 
     check("named tool choice", named_choice_check, required=False)
+
+    if args.check_namespaces:
+        namespace = "mcp__probe"
+        tools = [{"type": "namespace", "name": namespace, "description": "MCP compatibility probe", "tools": [TOOL]}]
+        payload = dict(tool_payload, tools=tools, input="Call mcp__probe.add_numbers with a=2 and b=3. After receiving the tool result, reply with exactly that result.")
+        namespaced_result = check("namespaced function calling", lambda: tool_check(payload, namespace))
+        if namespaced_result:
+            check("namespaced tool continuation", lambda: continuation_check(namespaced_result, tools))
+        else:
+            required_ok = False
+            print("FAIL  namespaced tool continuation: namespaced function calling failed")
 
     verdict = "DIRECT_READY" if required_ok else "INCOMPATIBLE"
     print(f"\n{verdict}")

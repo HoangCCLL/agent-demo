@@ -1,5 +1,11 @@
 # Phase 1.1 Native Codex CLI Parity Implementation Plan
 
+> Operator handoff: use [the current VPS/LAN runbook](../../phase11-runbook.md).
+> The 2026-09-22 checks add opt-in profiles, explicit model catalogs, mandatory
+> sandbox verification, and a namespace preflight. The tested Qwen backend
+> currently rejects namespace tools; the original flat-function gate below
+> alone does not establish compatibility with Codex CLI 0.155.1.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Extend the existing harness to prove at least 19 of 20 stable/default Codex CLI capabilities while hosting Search and Playwright MCP once on a shared LAN service VPS.
@@ -402,7 +408,7 @@ git commit -m "feat: verify Codex image input capability"
 
 **Interfaces:**
 
-- Consumes: existing Codex user config, `LLM_BASE_URL`, `LLM_MODEL`, `MCP_AUTH_TOKEN`, `SEARCH_MCP_URL`, and `PLAYWRIGHT_MCP_URL`.
+- Consumes: existing Codex base config, selected `CODEX_PROFILE`, `LLM_BASE_URL`, `LLM_MODEL`, `MCP_AUTH_TOKEN`, `SEARCH_MCP_URL`, and `PLAYWRIGHT_MCP_URL`.
 - Produces: one line per gate, a numeric `CAPABILITY_SCORE`, and `PHASE11_VPS_READY` only when the spec threshold passes.
 
 - [ ] **Step 1: Write failing report and JSONL parser tests**
@@ -524,7 +530,7 @@ Generate the vision screenshot first by running `verify_playwright_mcp.py` with 
 
 Create one `TemporaryDirectory`, initialize Git, and set repository-local test identity. Implement these checks:
 
-1. `codex mcp get web_search --json` and `codex mcp get playwright --json` must succeed. Allow names to be overridden by `CODEX_SEARCH_MCP_NAME` and `CODEX_PLAYWRIGHT_MCP_NAME`.
+1. `codex -p "$CODEX_PROFILE" mcp get web_search --json` and the equivalent Playwright lookup must succeed. Allow names to be overridden by `CODEX_SEARCH_MCP_NAME` and `CODEX_PLAYWRIGHT_MCP_NAME`.
 2. Run `codex exec --json -s read-only` with `Reply exactly EXEC_JSON_OK. Do not use tools.`; require `thread.started`, `turn.completed`, and the marker. Award `exec_jsonl`.
 3. Add `check_result.py` that asserts `result.txt == "PHASE11_EDIT_OK\n"`. Run Codex with `-s workspace-write` and instruct it to create the file and run the checker. Require a `command_execution` item, the exact file content, and successful checker execution. Award `shell` and `filesystem`.
 4. Capture the thread ID from a JSONL turn that remembers a random `SESSION_<hex>` marker. Resume with `codex exec resume --json <thread-id>` and require the marker. Award `session_resume`.
@@ -610,7 +616,7 @@ Document these exact stages in `docs/phase11-runbook.md`:
 3. Service VPS firewall: allow TCP 18081/18082 only from Codex client IPs.
 4. Client VPS: create a client env file containing MCP URLs and the shared demo token.
 5. Client VPS: run scripts/verify_remote_mcp.sh <client-env-file>.
-6. Client VPS: configure both remote MCP servers in ~/.codex/config.toml.
+6. Client VPS: install an opt-in profile containing the open-weight provider and both remote MCP servers; leave `~/.codex/config.toml` on OpenAI.
 7. Client VPS: export MCP_AUTH_TOKEN before starting a new Codex session.
 8. Client VPS: run python3 verify_codex_vps.py --env-file <client-env-file>.
 9. Accept only PHASE11_VPS_READY and CAPABILITY_SCORE >= 19/20.
