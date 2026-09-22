@@ -1,0 +1,15 @@
+# Force translation: forwarding /responses directly would retain the LM Studio
+# namespace rejection. MCP execution remains on the Codex -> MCP service path.
+model_list:
+  - model_name: os.environ/LLM_MODEL
+    litellm_params:
+      model: os.environ/LITELLM_UPSTREAM_MODEL
+      api_base: os.environ/LMSTUDIO_BASE_URL
+      api_key: os.environ/LMSTUDIO_API_KEY
+      use_chat_completions_api: true
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+
+# ponytail: one trusted-LAN demo key, no DB/Redis or server-side response history.
+# Clients replay input history; add stored state/per-client keys only when needed.

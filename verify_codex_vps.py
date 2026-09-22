@@ -409,9 +409,10 @@ def verify(root, source, env, timeout, report):
             return
 
     provider_args = ["--base-url", env.get("LLM_BASE_URL", ""), "--model", env.get("LLM_MODEL", ""),
-                     "--timeout", str(timeout), "--api-key-env", env["_HARNESS_API_KEY_ENV"]]
+                     "--timeout", str(timeout), "--api-key-env", env["_HARNESS_API_KEY_ENV"],
+                     "--continuation-mode", env.get("LLM_CONTINUATION_MODE", "previous-response-id")]
     print("INFO  checking Responses namespace tools before Codex agent turns", flush=True)
-    result = script("check_codex_api.py", provider_args + ["--check-namespaces"], {
+    result = script("check_codex_api.py", provider_args + ["--check-auth", "--check-namespaces"], {
         "PASS Responses API": "responses", "PASS Responses streaming": "streaming",
         "PASS namespaced function calling": "function_calling",
         "PASS namespaced tool continuation": "tool_continuation",

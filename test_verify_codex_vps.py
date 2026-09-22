@@ -141,7 +141,7 @@ class CodexVpsVerifierTest(unittest.TestCase):
             (root / "config.toml").write_text('model="qwen/test"\nmodel_provider="lan"\n'
                 '[model_providers.lan]\nname="LAN"\nbase_url="http://llm/v1"\nenv_key="LLM_API_KEY"\n')
             env = {"CODEX_HOME": str(root), "LLM_MODEL": "qwen/test", "LLM_BASE_URL": "http://llm/v1",
-                   "LLM_API_KEY": "test-secret"}
+                   "LLM_API_KEY": "test-secret", "LLM_CONTINUATION_MODE": "input-history"}
             commands = []
 
             def execute(args, *unused):
@@ -149,8 +149,11 @@ class CodexVpsVerifierTest(unittest.TestCase):
                 if Path(args[0]).name == "git":
                     return subprocess.CompletedProcess(args, 0, "", "")
                 self.assertEqual(Path(args[1]).name, "check_codex_api.py")
+                self.assertIn("--check-auth", args)
                 self.assertIn("--check-namespaces", args)
                 self.assertEqual(args[args.index("--api-key-env") + 1], "LLM_API_KEY")
+                self.assertIn("--continuation-mode", args)
+                self.assertEqual(args[args.index("--continuation-mode") + 1], "input-history")
                 return subprocess.CompletedProcess(args, 1,
                     "PASS  Responses API\nPASS  Responses streaming\n"
                     "FAIL  namespaced function calling: unsupported namespace\nINCOMPATIBLE\n", "")

@@ -31,6 +31,9 @@ def main():
     parser.add_argument("--concurrency", type=int, default=3)
     parser.add_argument("--timeout", type=float, default=90)
     parser.add_argument("--api-key-env", default="OPENAI_API_KEY")
+    parser.add_argument("--continuation-mode", choices=("previous-response-id", "input-history"),
+                        default="previous-response-id",
+                        help="input-history does not require hosted Responses state")
     parser.add_argument("--vision-image")
     parser.add_argument("--vision-expected", default="VISION_7F31")
     args = parser.parse_args()
@@ -126,7 +129,10 @@ def main():
             raise
         raise RuntimeError("unknown previous_response_id was accepted")
 
-    required("invalid conversation state", invalid_previous_id_check)
+    if args.continuation_mode == "previous-response-id":
+        required("invalid conversation state", invalid_previous_id_check)
+    else:
+        print("SKIP  server-stored conversation state: input-history mode; no hosted state claimed")
 
     tool = {
         "type": "function",

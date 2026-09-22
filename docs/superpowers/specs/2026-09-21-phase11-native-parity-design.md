@@ -7,14 +7,16 @@ OpenAI-compatible open-weight model endpoint, while keeping the runtime small
 and avoiding services that duplicate capabilities already provided by Codex
 CLI and the client host.
 
-Phase 1.1 extends verification coverage. It does not add GitHub MCP, RAG,
-memory, hosted sandbox, LiteLLM, desktop automation, or an observability stack.
+Phase 1.1 extends verification coverage. The approved 2026-09-22 update adds
+LiteLLM to translate Codex Responses namespace tools for LM Studio. It does
+not add GitHub MCP, RAG, memory, hosted sandbox, desktop automation, or an
+observability stack.
 
 ## Scope
 
 Included:
 
-- direct OpenAI-compatible Responses API model traffic;
+- OpenAI-compatible Responses API model traffic through a LiteLLM bridge;
 - local shell, filesystem, Git, code execution, and background processes;
 - Search MCP backed by SearXNG;
 - browser automation through Playwright MCP;
@@ -44,18 +46,19 @@ equivalents used for the excluded hosted API primitives.
 Model traffic and tool traffic remain independent.
 
 ```text
-Codex CLI VPS A ─┬──────── Responses API ───────► Open-weight LLM server
+Codex CLI VPS A ─┬──────── Responses API ───────► LiteLLM on LAN service VPS
                  │
                  ├──────── Search MCP ─────────► LAN MCP service VPS
                  └──────── Playwright MCP ─────► LAN MCP service VPS
 
-Codex CLI VPS B ─┬──────── Responses API ───────► Open-weight LLM server
+Codex CLI VPS B ─┬──────── Responses API ───────► LiteLLM on LAN service VPS
                  │
                  ├──────── Search MCP ─────────► LAN MCP service VPS
                  └──────── Playwright MCP ─────► LAN MCP service VPS
 
-LAN MCP service VPS
+LAN service VPS
 └── Docker Compose
+    ├── LiteLLM (LAN port, bearer protected) ──► LM Studio /v1/chat/completions
     ├── SearXNG (internal only)
     ├── Search MCP (LAN port, bearer protected)
     ├── Playwright MCP (internal only)
@@ -63,9 +66,37 @@ LAN MCP service VPS
     └── deterministic test site (internal only)
 ```
 
-The Docker stack is installed once on the LAN MCP service VPS. A Codex client
-must not install or run copies of these containers. It only needs network
-access, MCP URLs, and the bearer token.
+The same `compose.yaml` runs the whole stack once on the LAN service VPS.
+Clients need the gateway and MCP URLs and their bearer credentials, with no
+Docker or direct LM Studio access. Only the service VPS needs a route to the
+LM Studio host. Python is not required on the service host; LiteLLM runs inside
+its container.
+
+### Model bridge contract
+
+Pin the bridge image to `ghcr.io/berriai/litellm:v1.98.0`, which contains the
+Responses namespace fix. Route `LLM_MODEL=qwen/qwen3.8-27b` through the OpenAI
+Chat Completions provider, with `use_chat_completions_api: true`, to LM Studio
+`0.4.25` at `LMSTUDIO_BASE_URL=http://192.168.110.16:1235/v1`. A floating or older
+image is not an accepted substitute. MCP remains direct to Search/Playwright;
+LiteLLM handles only model traffic.
+
+The bridge listens on `LITELLM_PORT=4000`, with `LITELLM_BIND_ADDRESS=127.0.0.1`
+for local tests or the explicit VPS LAN IP for shared use. The service owns
+`LITELLM_MASTER_KEY=sk-...` and `LMSTUDIO_API_KEY` (`not-needed` if upstream auth
+is disabled). Clients use `LLM_BASE_URL=http://192.0.2.20:4000/v1` with the real
+VPS address and `LLM_API_KEY` equal to the gateway master key. They do not
+receive the LM Studio key. The combined local `.env` must also set its
+`LLM_API_KEY` equal to `LITELLM_MASTER_KEY`.
+
+No database or Redis is added. `LLM_CONTINUATION_MODE=input-history` makes the
+checks replay prior response output plus tool results, as Codex does with
+explicit conversation input. Hosted `previous_response_id` or Conversations
+API state is not part of this bridge contract; invalid hosted-state runtime
+testing is explicitly skipped in this mode. The native direct checker keeps
+`previous-response-id` as a selectable default for other endpoints. These
+limits must be reflected in output; no hosted state-support claim follows
+from input-history continuation passing.
 
 Plain `codex` keeps the user's normal OpenAI configuration. The open-weight
 model and LAN MCP tools live in an opt-in Codex profile selected with
@@ -74,15 +105,16 @@ endpoints while sharing the MCP service.
 
 ## LAN Deployment Contract
 
-The service host binds MCP ports to one explicit LAN interface address. It must
-not bind MCP ports to a public interface or publish SearXNG, Playwright, or the
-test site directly.
+The service host binds the LiteLLM and MCP ports to one explicit LAN interface
+address. It must not bind them to a public interface or publish SearXNG,
+Playwright, or the test site directly.
 
 Example client endpoints:
 
 ```text
-http://192.168.110.20:18081/mcp  # Search MCP
-http://192.168.110.20:18082/mcp  # Playwright MCP auth proxy
+http://192.0.2.20:4000/v1    # LiteLLM Responses gateway
+http://192.0.2.20:18081/mcp  # Search MCP
+http://192.0.2.20:18082/mcp  # Playwright MCP auth proxy
 ```
 
 The actual address is configuration, not a hard-coded repository value.
@@ -90,17 +122,20 @@ The actual address is configuration, not a hard-coded repository value.
 Required LAN controls:
 
 - bind to the service VPS LAN IP rather than `0.0.0.0` when possible;
-- allow inbound MCP ports only from approved Codex client IPs/subnets;
-- require bearer authentication on both MCP endpoints;
+- allow inbound ports `4000`, `18081`, and `18082` only from approved Codex clients;
+- require bearer authentication on the gateway and both MCP endpoints;
 - keep tokens in environment variables and out of Git;
-- reject unauthenticated MCP initialization;
+- reject missing/wrong gateway authentication and unauthenticated MCP initialization;
 - keep Docker-internal backends unexposed.
 
 Plain HTTP with a bearer token is accepted only for an isolated demo LAN. Use
 TLS or a trusted encrypted overlay such as WireGuard/Tailscale before the same
-service crosses an untrusted network. A single shared demo token is acceptable
-for Phase 1.1; per-client credentials and audit attribution are production
-follow-up work.
+service crosses an untrusted network. A shared MCP token and shared LiteLLM
+master key are accepted for trusted demo clients only; the master key is not
+per-user isolation. Keep the SearXNG secret and LM Studio backend key on the
+service host. Per-client credentials and audit attribution are production
+follow-up work. Firewall policy must cover Docker-published ports and same-LAN
+traffic, and only the service VPS needs access to the LM Studio port.
 
 ## Codex Client Contract
 
@@ -112,24 +147,34 @@ file editing stays available through shell commands. The installer preserves
 the OpenAI base config and refuses differing existing output files.
 
 The observed Codex 0.155.1 wire format nests MCP functions in Responses
-`namespace` tools. The demo endpoint currently rejects this format. Missing
-model metadata was an unproven diagnosis, superseded by an actual namespace
-HTTP 400. The catalog does not resolve that API mismatch. Run
-`check_codex_api.py --check-namespaces` before CLI integration; stop and update
-the backend or use a separately verified compatible CLI before LAN rollout.
+`namespace` tools. The direct LM Studio endpoint rejected this format with
+HTTP 400; the LiteLLM bridge addresses that mismatch. The model catalog does
+not itself provide API compatibility. Run
+`bash scripts/verify_model_api.sh .env.client` before CLI integration and
+require `MODEL_API_READY`. This check needs no Codex and verifies missing/wrong
+credential rejection, model discovery, flat and namespaced functions,
+streaming, and input-history continuation. The checker's `DIRECT_READY` means
+the selected API endpoint passed; it does not mean direct LM Studio traffic.
 The current operational steps are in `docs/phase11-runbook.md`.
+
+Existing `.env`/`.env.vps` files are not automatically migrated. Operators must
+add the service bridge variables, update each client endpoint/key and
+continuation mode, then regenerate the opt-in profile. The installer refuses
+differing existing profiles/catalogs: back up and move both aside, or select a
+new name such as `--profile openweight-bridge` and use it consistently. Plain
+`codex` continues to use the base OpenAI configuration.
 
 Each Codex VPS configures its open-weight profile with the model provider and
 remote Streamable HTTP servers:
 
 ```toml
 [mcp_servers.web_search]
-url = "http://192.168.110.20:18081/mcp"
+url = "http://192.0.2.20:18081/mcp"
 bearer_token_env_var = "MCP_AUTH_TOKEN"
 required = true
 
 [mcp_servers.playwright]
-url = "http://192.168.110.20:18082/mcp"
+url = "http://192.0.2.20:18082/mcp"
 bearer_token_env_var = "MCP_AUTH_TOKEN"
 required = true
 startup_timeout_sec = 30
@@ -181,9 +226,10 @@ The read-only sandbox gate is mandatory regardless of the numeric score.
 
 ### Service-host local verification
 
-`scripts/setup.sh` continues to start the Docker stack and run deterministic
-checks. Phase 1.1 extends the aggregate verification with image input and a
-capability summary.
+`scripts/setup.sh` continues to start the Docker stack and run the local
+verification suite. The aggregate verification includes gateway authentication,
+Responses namespaces, explicit input-history continuation, image input, and
+a capability summary.
 
 Expected terminal condition:
 
@@ -195,12 +241,30 @@ This proves model/API compatibility, local primitives, MCP protocol behavior,
 real search, and real browser automation. It does not claim that a remote Codex
 client is configured correctly.
 
+Historical local passes from before this bridge was added do not accept the
+new gateway, authentication, namespace handling, or image path. Rerun the
+relevant checks against the deployed bridge and record its versions.
+
+### Service VPS deployment
+
+Deployment consists of `docker compose --env-file .env.vps -f compose.yaml`
+with `config --quiet`, `pull`, and `up -d --wait --wait-timeout 180`. It does not
+automatically run local tests, contact the model, or start Codex. Do not use
+the local `setup.sh` entry point on this host. Compose health and LiteLLM
+`/health/liveliness` establish process readiness, not upstream LM Studio
+reachability, tool compatibility, or acceptance.
+
 ### Remote network verification
 
 From each Codex client VPS, a dependency-free verifier calls the LAN MCP URLs
 using the configured bearer token. It verifies authentication rejection,
 initialization, tool discovery, search, URL reading, browser navigation, form
 interaction, screenshot, and download.
+
+Run `bash scripts/verify_model_api.sh .env.client` separately against the model
+gateway and require `MODEL_API_READY`. Run the MCP verifier and require
+`REMOTE_MCP_READY`. Neither test needs Codex to be installed. An unapproved
+LAN source must fail TCP connection attempts to all three published ports.
 
 The browser target remains `http://test-site/` because that name is resolved by
 the Docker network from inside the Playwright container. A host-side failure to
@@ -271,7 +335,7 @@ filesystem paths. Browser artifacts remain ephemeral inside the service stack.
 ## Deferred Work
 
 - RAG after a real corpus and retrieval evaluation set exist;
-- LiteLLM when multi-model routing or a separate vision model is required;
+- multi-model routing or a separate vision model when required;
 - OpenSandbox when untrusted execution must be isolated from the Codex host;
 - GitHub MCP when typed permissions provide value beyond `gh`;
 - per-client MCP tokens, TLS automation, rate limiting, and centralized audit;
@@ -283,7 +347,8 @@ filesystem paths. Browser artifacts remain ephemeral inside the service stack.
 Phase 1.1 is accepted when:
 
 1. the service-host local suite ends with `PHASE11_LOCAL_READY`;
-2. the client VPS can reach both bearer-protected LAN MCP endpoints;
+2. the client VPS passes `MODEL_API_READY` and reaches both bearer-protected
+   LAN MCP endpoints;
 3. the manual Codex CLI suite ends with `PHASE11_VPS_READY`;
 4. at least 19 of 20 capability gates pass;
 5. all critical gates pass;

@@ -1,6 +1,36 @@
 name: codex-phase1
 
 services:
+  litellm:
+    # v1.98.0 includes Codex namespace request/response/stream mapping (#32536).
+    image: ghcr.io/berriai/litellm:v1.98.0
+    restart: unless-stopped
+    init: true
+    command: ["--config", "/app/config.yaml", "--host", "0.0.0.0", "--port", "4000"]
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?Set LITELLM_MASTER_KEY in the selected env file; see .env.vps.example}
+      LLM_MODEL: ${LLM_MODEL:-qwen/qwen3.8-27b}
+      LITELLM_UPSTREAM_MODEL: openai/${LLM_MODEL:-qwen/qwen3.8-27b}
+      LMSTUDIO_BASE_URL: ${LMSTUDIO_BASE_URL:?Set LMSTUDIO_BASE_URL to the LM Studio /v1 endpoint}
+      LMSTUDIO_API_KEY: ${LMSTUDIO_API_KEY:-not-needed}
+      LITELLM_LOG: WARNING
+      DO_NOT_TRACK: "true"
+    volumes:
+      - ./docker/litellm/config.yaml:/app/config.yaml:ro
+    ports:
+      - "${LITELLM_BIND_ADDRESS:-127.0.0.1}:${LITELLM_PORT:-4000}:4000"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 1g
+    cpus: 1.0
+    healthcheck:
+      # Liveness only: no model request and no dependency on LM Studio availability.
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness', timeout=5).read()"]
+      interval: 10s
+      timeout: 6s
+      start_period: 30s
+      retries: 12
+
   searxng:
     image: ghcr.io/searxng/searxng:2026.9.11-61d660276
     restart: unless-stopped

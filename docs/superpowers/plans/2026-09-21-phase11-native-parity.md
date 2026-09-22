@@ -2,9 +2,12 @@
 
 > Operator handoff: use [the current VPS/LAN runbook](../../phase11-runbook.md).
 > The 2026-09-22 checks add opt-in profiles, explicit model catalogs, mandatory
-> sandbox verification, and a namespace preflight. The tested Qwen backend
-> currently rejects namespace tools; the original flat-function gate below
-> alone does not establish compatibility with Codex CLI 0.155.1.
+> sandbox verification, and a namespace preflight. Direct LM Studio rejected
+> namespace tools; the approved follow-up adds a pinned LiteLLM bridge to the
+> same Compose stack and supersedes this plan's original no-new-container
+> constraint. Existing env files/profiles require the runbook's migration steps.
+> Old flat-function/local results do not accept the new bridge: run gateway
+> authentication, namespace, and full Codex gates before LAN rollout.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

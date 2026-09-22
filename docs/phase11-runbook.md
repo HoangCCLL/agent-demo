@@ -1,16 +1,18 @@
 # Phase 1.1: local checks, VPS integration, and LAN clients
 
-Run Search and Playwright Docker services once on a shared LAN VPS. Each Codex
-client connects to those endpoints and the model server; clients need no
-Docker. Plain `codex` uses the existing OpenAI configuration. The explicit
-`codex -p openweight` profile selects the LAN model and MCP tools.
+Run LiteLLM, Search, and Playwright Docker services once on a shared LAN VPS.
+Codex sends Responses requests to LiteLLM, which bridges them to LM Studio
+`0.4.25` at `/v1/chat/completions`. Search and Playwright MCP connections go
+directly to their authenticated endpoints on that VPS. Clients need no Docker
+or direct access to LM Studio. Plain `codex` uses the existing OpenAI
+configuration; `codex -p openweight` selects the opt-in LAN model and MCP tools.
 
 Choose the files for the machine you are preparing:
 
 | Machine | Template / private file | Workflow |
 |---|---|---|
 | Local demo/test host | [`.env.example`](../.env.example) → `.env` | Section 1: setup and local verification |
-| Shared MCP VPS | [`.env.vps.example`](../.env.vps.example) → `.env.vps` | Section 2: Docker services only |
+| Shared service VPS | [`.env.vps.example`](../.env.vps.example) → `.env.vps` | Section 2: Docker services only |
 | Codex workstation or client VPS | [`.env.client.example`](../.env.client.example) → `.env.client` | Sections 3–5: opt-in profile, acceptance, use |
 
 One [Compose file](../compose.yaml) serves local testing and the shared VPS.
@@ -21,20 +23,20 @@ The final `19/20` gate measures this harness's functional coverage, not equal
 model quality or 95% coverage of every OpenAI product feature. Local protocol
 checks do not establish that Codex integration passed; run the VPS gates too.
 
-Last recorded compatibility finding (2026-09-22): Codex CLI `0.155.1` sends MCP tools as
-Responses `namespace` tools. The current Qwen endpoint accepts flat function
-tools but rejects the namespace request with HTTP `400`. The scripts and
-configuration are ready to test; this backend is not ready for LAN rollout
-until it passes the namespace preflight below. A custom model catalog does
-not fix that protocol mismatch. Use a backend with namespace support or a
-separately verified compatible Codex version; no older version is assumed to
-work, and these scripts do not automatically downgrade or insert a proxy.
+Compatibility finding (2026-09-22): Codex CLI `0.155.1` sends MCP functions as
+Responses `namespace` tools, which the direct Qwen/LM Studio endpoint rejected
+with HTTP `400`. The Compose stack now includes LiteLLM `v1.98.0`, pinned as
+`ghcr.io/berriai/litellm:v1.98.0`, with the namespace bridge fix. A model catalog
+alone cannot fix this mismatch.
+Deployment is not acceptance: run the authenticated model/namespace preflight
+and the full client integration below before LAN rollout.
 
-Local verification on 2026-09-22: all 38 tests passed, including the installed
-Codex profile/catalog parser check; the live service pipeline returned
-`PHASE11_LOCAL_READY` and `VISION_SUPPORTED`. The separate namespace preflight
-returned `INCOMPATIBLE` (exit 1, HTTP 400). Full client-VPS integration and
-multi-client rollout remain unaccepted.
+Historical verification on 2026-09-22, before adding the bridge: all 38 tests
+passed, the old local pipeline returned `PHASE11_LOCAL_READY` and
+`VISION_SUPPORTED`, and the separate namespace preflight failed with HTTP 400.
+Those results do not accept the bridge, its authentication, or its image
+support. Full client-VPS integration and multi-client rollout remain
+unaccepted until the new checks pass.
 
 ## 1. Verify the service stack locally
 
@@ -46,10 +48,15 @@ bash scripts/setup.sh
 ```
 
 This generates `.env` if absent, starts containers, then runs the unit tests,
-client primitives, Responses API, real Search/Playwright calls, and model
-runtime checks. Keep `MCP_BIND_ADDRESS=127.0.0.1` for this local-only stage.
-After changing an existing `.env`, rerun setup. To repeat verification without
-pulling/restarting containers:
+client primitives, authenticated Responses API and namespace preflight, real
+Search/Playwright calls, and model runtime checks. Keep both
+`MCP_BIND_ADDRESS=127.0.0.1` and `LITELLM_BIND_ADDRESS=127.0.0.1` for this
+local-only stage. Set `LLM_BASE_URL=http://127.0.0.1:4000/v1` and make the local
+`LLM_API_KEY` equal `LITELLM_MASTER_KEY`; `LMSTUDIO_API_KEY` is the separate
+upstream credential. Use `LLM_CONTINUATION_MODE=input-history` for the bridge.
+Existing `.env` files are not rewritten: add the new bridge settings described
+below before rerunning setup. To repeat verification
+without pulling/restarting containers:
 
 ```bash
 bash scripts/verify_all.sh
@@ -67,13 +74,16 @@ Use a Linux VPS with Docker Engine and its Compose plugin, and OpenSSL for
 generating secrets. Copy/clone the same harness revision, including `docker/`
 (Compose bind-mounts those configuration and fixture files). Run all commands
 below from that checkout. The operator must have permission to use Docker.
-Python, Node.js, Codex, a GPU, a model server, and LiteLLM are not required on
-this MCP-only host. Browser and search dependencies run inside the containers.
+Python, Node.js, Codex, a GPU, and a host LiteLLM installation are not required
+on this service host. LiteLLM, browser, and search dependencies run inside
+containers. The VPS needs network access to the separate LM Studio server at
+`192.168.110.16:1235`; that access is not required on Codex clients.
 
 The existing stack contains:
 
 | Compose service | Purpose | Published on the VPS |
 |---|---|---|
+| `litellm` | Authenticated Responses-to-Chat-Completions model bridge | LAN IP, TCP `4000` |
 | `searxng` | Search backend | No |
 | `search-mcp` | Authenticated Search MCP and URL reader | LAN IP, TCP `18081` |
 | `playwright` | Headless browser MCP | No |
@@ -83,7 +93,10 @@ The existing stack contains:
 Caddy is already included; do not install a second host proxy. Its current
 configuration serves HTTP, not HTTPS. `/health` checks the proxy itself and
 is intentionally public; MCP requests require the bearer token. Search MCP
-enforces its own authentication. Neither proxy sits on the model traffic path.
+enforces its own authentication. Model requests pass through LiteLLM separately;
+MCP calls do not pass through LiteLLM. The model bridge uses the image pinned in
+`compose.yaml`; do not replace it with a floating tag or a release that predates
+the namespace fix.
 
 ### Prepare the private VPS environment
 
@@ -95,21 +108,43 @@ chmod 600 .env.vps
 # First output: MCP_AUTH_TOKEN. Second output: SEARXNG_SECRET.
 openssl rand -hex 32
 openssl rand -hex 32
+# Third output: prepend sk- and use it as LITELLM_MASTER_KEY.
+openssl rand -hex 32
 ```
 
 Edit `.env.vps` before starting anything:
 
-- Replace `192.0.2.20` in the bind address, allowed hosts, and allowed origins
+- Replace `192.0.2.20` in both bind addresses, allowed hosts, and allowed origins
   with the VPS's actual LAN interface IP. Do not bind `0.0.0.0` for this demo.
-- Replace both placeholder secrets with the two independently generated values.
+- Replace the MCP, SearXNG, and LiteLLM placeholder secrets with independent
+  values. `LITELLM_MASTER_KEY` must start with `sk-`.
 - If changing port `18081`, update both Search host/origin values too.
+- Set `LITELLM_BIND_ADDRESS` to the VPS LAN IP and `LITELLM_PORT=4000`.
+- Set `LMSTUDIO_BASE_URL=http://192.168.110.16:1235/v1`,
+  `LMSTUDIO_API_KEY=not-needed` if upstream authentication is disabled (otherwise
+  its real API key), and `LLM_MODEL=qwen/qwen3.8-27b` to match the served model.
 
-The file contains only service variables; do not copy the client or model
-credentials into it. Keep assignments literal: the commands below source this
-trusted file. Exported shell values override Compose env files, so the subshell
-loads this file explicitly and keeps these credentials out of your parent shell.
-Distribute only the MCP URLs and `MCP_AUTH_TOKEN` to approved client operators;
-never distribute `SEARXNG_SECRET` or commit the private `.env.vps` file.
+The service file holds the bridge's upstream URL/key and gateway master key;
+Codex profile settings belong on clients. Keep assignments literal: the commands
+below source this trusted file. Exported shell values override Compose env files,
+so the subshell loads this file explicitly and keeps these credentials out of
+your parent shell. Give approved client operators the MCP URLs/token, gateway
+URL, and gateway master key as their `LLM_API_KEY`. Never distribute
+`SEARXNG_SECRET`, `LMSTUDIO_API_KEY`, or the private `.env.vps` file. The shared
+gateway master key has admin access; this is a trusted-client demo, not
+per-user isolation.
+
+### Upgrade an existing deployment
+
+Template changes do not update private `.env` or `.env.vps` files. Add
+`LITELLM_BIND_ADDRESS`, `LITELLM_PORT`, `LITELLM_MASTER_KEY`,
+`LMSTUDIO_BASE_URL`, `LMSTUDIO_API_KEY`, and `LLM_MODEL` using the values above;
+for local `.env`, use loopback and set `LLM_BASE_URL`/`LLM_API_KEY` as in section 1.
+Then run the deployment commands below. On every client, change
+`LLM_BASE_URL` to `http://192.0.2.20:4000/v1` (with the real VPS LAN IP), set
+`LLM_API_KEY` to the gateway master key and `LLM_CONTINUATION_MODE=input-history`,
+and regenerate its opt-in profile as described in section 3. Updating the env
+file alone does not replace the endpoint stored in an existing profile.
 
 ### Start services without running tests
 
@@ -129,14 +164,15 @@ Apply the firewall policy below before starting the LAN-bound stack. Then run:
 ```
 
 Use `--env-file .env.vps -f compose.yaml` for subsequent Compose commands too.
-Do not use `scripts/setup.sh` on this MCP-only host: it is the local demo entry
+Do not use `scripts/setup.sh` on this service host: it is the local demo entry
 point and automatically runs the full verification suite using `.env`.
 
 `up --wait` only establishes Compose startup/health status, not working MCP
-tools or model compatibility. In particular, Caddy health does not prove the
-browser backend works. No `PHASE11_LOCAL_READY` marker is expected here; run
-the authenticated remote MCP checks from the client when ready (section 3).
-The two published ports must use the explicit LAN IP; all other services
+tools or model compatibility. Caddy health does not prove the browser backend
+works; LiteLLM `/health/liveliness` does not prove LM Studio connectivity or
+namespace support. No `PHASE11_LOCAL_READY` marker is expected here; run the
+authenticated model and MCP checks from the client when ready (section 3).
+The three published ports must use the explicit LAN IP; all other services
 remain Docker-internal. Compose has a fixed project name, `codex-phase1`:
 do not run the local and VPS configurations as two stacks on the same host.
 
@@ -144,7 +180,7 @@ do not run the local and VPS configurations as two stacks on the same host.
 
 Use an upstream firewall on the actual path to the service VPS: router,
 hypervisor firewall, enforced VLAN policy, or security appliance. Allow TCP
-`18081` and `18082` to the service IP only from approved client IPs; deny
+`4000`, `18081`, and `18082` to the service IP only from approved client IPs; deny
 those destination ports from every other source. Review existing broad
 allows, and preserve/test SSH management access from a second session.
 
@@ -156,16 +192,20 @@ Docker-aware host filtering, such as `DOCKER-USER` on the iptables backend,
 before deployment; ordinary UFW `INPUT` rules are insufficient for
 [Docker-published ports](https://docs.docker.com/engine/network/packet-filtering-firewalls/#docker-and-ufw).
 
-From each approved client, run the authenticated remote verifier in section 3
-and require `REMOTE_MCP_READY`. While services remain running, test from an
+Allow the LM Studio port (`1235` in this example) from the service VPS; clients
+need access only to the three published service ports.
+
+From each approved client, run the authenticated model and remote MCP checks
+in section 3. While services remain running, test from an
 unapproved LAN client with `nc` installed:
 
 ```bash
+nc -vz -w 5 192.0.2.20 4000
 nc -vz -w 5 192.0.2.20 18081
 nc -vz -w 5 192.0.2.20 18082
 ```
 
-Both connections must fail or time out with nonzero exit status. HTTP `401`
+All three connections must fail or time out with nonzero exit status. HTTP `401`
 after a successful TCP connection fails this network check; command-not-found
 does not count as a pass. Record approved and unapproved source IPs/results.
 Plain HTTP with bearer tokens is suitable only for the isolated demo LAN;
@@ -182,9 +222,9 @@ record your version and repeat acceptance after upgrades.
 
 Copy/clone the same harness revision to each client. Do not run `setup.sh` or
 install Docker, Caddy, SearXNG, Playwright, or Chromium here. Each client needs
-network access to both MCP URLs **and directly to the separate LLM endpoint**.
-The shared MCP VPS does not relay model requests. Use sections 3 and 4 from
-the harness checkout; day-to-day Codex use can start in any project directory.
+network access to the gateway URL and both MCP URLs on the service VPS.
+Only that VPS connects to the separate LM Studio endpoint. Use sections 3 and 4
+from the harness checkout; day-to-day Codex use can start in any project directory.
 
 ### Keep OpenAI as the default
 
@@ -215,15 +255,24 @@ test -e .env.client || cp .env.client.example .env.client
 chmod 600 .env.client
 ```
 
-Set the LAN URLs/token, exact `LLM_MODEL` returned by `/v1/models`, and these
-explicit capability declarations:
+Set `LLM_BASE_URL=http://192.0.2.20:4000/v1` with the actual service VPS LAN IP,
+the MCP URLs/token, `LLM_MODEL=qwen/qwen3.8-27b` matching the gateway route, and
+these explicit capability declarations:
 
 - `LLM_CONTEXT_WINDOW`: the context limit configured on this server, in tokens.
   The template's `32768` is an example, not a claim about the model's maximum.
 - `LLM_SUPPORTS_IMAGE`: `true` only after the real image gate passed; otherwise
   use `false`. Text-only operation is allowed, but affects the final score.
-- `LLM_API_KEY`: optional authentication for the LAN model endpoint. It is
-  referenced through the environment, never serialized into profile/catalog.
+- `LLM_API_KEY`: required gateway authentication, equal to the service operator's
+  `LITELLM_MASTER_KEY`. This is not `LMSTUDIO_API_KEY`; clients do not receive the
+  backend secret. It is referenced through the environment, never serialized
+  into profile/catalog.
+- `LLM_CONTINUATION_MODE=input-history`: the checker replays the prior response
+  output and function result in the next request, matching Codex's explicit
+  conversation input. This bridge deployment has no database or Redis and
+  does not promise hosted `previous_response_id`/conversation storage. The
+  runtime check explicitly skips invalid hosted-conversation-state testing in
+  this mode. Native endpoints can still be checked with `previous-response-id`.
 - `CODEX_PROFILE`: `openweight` by default; change it for another named choice.
 
 Environment files are trusted local input: shell commands below source them.
@@ -270,10 +319,42 @@ the separate config-only check below validates this with the installed binary
 before any model calls. The profile file layout follows the
 [official profile configuration](https://learn.chatgpt.com/docs/config-file/config-advanced#profiles).
 
+For an existing direct-to-LM-Studio profile, the simplest upgrade is to set
+`CODEX_PROFILE=openweight-bridge` in `.env.client` and install a new choice:
+
+```bash
+(
+  set -e
+  unset LLM_API_KEY
+  set -a
+  source .env.client
+  set +a
+  python3 scripts/install_codex_profile.py --env-file .env.client --profile openweight-bridge
+)
+```
+
+Alternatively, back up and move aside both the old `.config.toml` and matching
+`catalogs/<profile>.models.json` before rerunning the installer with the old
+name. Do not remove or replace the base `config.toml`; plain `codex` stays on
+OpenAI. A new profile name must also be used for verification and launch.
+
 ### Verify explicitly when ready
 
 These are separate checks, not part of installing the profile. The remote
 check really searches the web and operates the browser on the MCP VPS.
+
+First check gateway authentication and Responses namespace compatibility without
+running Codex (Python 3.11+, Bash, and network access are sufficient):
+
+```bash
+bash scripts/verify_model_api.sh .env.client
+```
+
+This rejects missing/wrong gateway credentials and checks authenticated model
+discovery, flat and namespaced function calls, streaming, and input-history
+continuation through LiteLLM to LM Studio. Require `MODEL_API_READY` before
+starting Codex acceptance. The nested checker's `DIRECT_READY` refers to the
+selected API endpoint; it does not mean Codex connects directly to LM Studio.
 
 ```bash
 (
@@ -290,7 +371,8 @@ check really searches the web and operates the browser on the MCP VPS.
 )
 ```
 
-Require `CODEX_PROFILE_READY` and `REMOTE_MCP_READY` before model-driven testing.
+Require `MODEL_API_READY`, `CODEX_PROFILE_READY`, and `REMOTE_MCP_READY` before
+model-driven testing.
 The profile marker verifies configuration only, not end-to-end capability.
 Record the CLI version alongside integration results.
 
@@ -309,8 +391,7 @@ The operator runs this step on the target VPS, after section 3 passes:
   set -a
   source .env.client
   set +a
-  python3 check_codex_api.py --base-url "$LLM_BASE_URL" --model "$LLM_MODEL" \
-    --api-key-env LLM_API_KEY --check-namespaces
+  bash scripts/verify_model_api.sh .env.client
   python3 -u verify_codex_vps.py --env-file .env.client --profile "$CODEX_PROFILE"
 )
 ```
@@ -379,7 +460,8 @@ profiles may share the LAN MCP endpoints. Applying a Qwen catalog to another
 model family requires that model's own capability checks; it is not a promise
 of compatibility.
 
-This shared-token setup is a trusted-client demo. Codex sessions and workspace
+This shared MCP token and gateway master-key setup is a trusted-client demo,
+not a per-user authorization boundary. Codex sessions and workspace
 files stay on each client, while browser downloads/screenshots may live on
 the MCP host; a path returned by remote Playwright is not a client-local file.
 Browser sessions, output storage, and finite container resources do not give
