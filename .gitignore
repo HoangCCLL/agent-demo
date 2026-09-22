@@ -2,6 +2,7 @@
 .env.*
 !.env.example
 !.env.client.example
+!.env.vps.example
 artifacts/
 __pycache__/
 .worktrees/

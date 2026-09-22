@@ -5,7 +5,7 @@ services:
     image: ghcr.io/searxng/searxng:2026.9.11-61d660276
     restart: unless-stopped
     environment:
-      SEARXNG_SECRET: ${SEARXNG_SECRET:?Run scripts/setup.sh first}
+      SEARXNG_SECRET: ${SEARXNG_SECRET:?Set SEARXNG_SECRET in the selected env file}
       SEARXNG_BASE_URL: http://searxng:8080/
       SEARXNG_BIND_ADDRESS: 0.0.0.0
       SEARXNG_PORT: "8080"
@@ -38,7 +38,7 @@ services:
       MCP_HTTP_HOST: 0.0.0.0
       MCP_HTTP_STATELESS: "false"
       MCP_HTTP_HARDEN: "true"
-      MCP_HTTP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:?Run scripts/setup.sh first}
+      MCP_HTTP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:?Set MCP_AUTH_TOKEN in the selected env file}
       MCP_HTTP_ALLOWED_HOSTS: ${SEARCH_MCP_ALLOWED_HOSTS:-127.0.0.1:18081,localhost:18081}
       MCP_HTTP_ALLOWED_ORIGINS: ${SEARCH_MCP_ALLOWED_ORIGINS:-http://127.0.0.1:18081}
     ports:
@@ -87,7 +87,7 @@ services:
     restart: unless-stopped
     depends_on: [playwright]
     environment:
-      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:?Run scripts/setup.sh first}
+      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:?Set MCP_AUTH_TOKEN in the selected env file}
     volumes:
       - ./docker/playwright/Caddyfile:/etc/caddy/Caddyfile:ro
     ports:

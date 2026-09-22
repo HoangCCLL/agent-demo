@@ -5,11 +5,23 @@ client connects to those endpoints and the model server; clients need no
 Docker. Plain `codex` uses the existing OpenAI configuration. The explicit
 `codex -p openweight` profile selects the LAN model and MCP tools.
 
+Choose the files for the machine you are preparing:
+
+| Machine | Template / private file | Workflow |
+|---|---|---|
+| Local demo/test host | [`.env.example`](../.env.example) → `.env` | Section 1: setup and local verification |
+| Shared MCP VPS | [`.env.vps.example`](../.env.vps.example) → `.env.vps` | Section 2: Docker services only |
+| Codex workstation or client VPS | [`.env.client.example`](../.env.client.example) → `.env.client` | Sections 3–5: opt-in profile, acceptance, use |
+
+One [Compose file](../compose.yaml) serves local testing and the shared VPS.
+Setup does not imply acceptance: the VPS deployment below does not invoke the
+test suite, LLM, or Codex. Run the separate verification commands when ready.
+
 The final `19/20` gate measures this harness's functional coverage, not equal
 model quality or 95% coverage of every OpenAI product feature. Local protocol
 checks do not establish that Codex integration passed; run the VPS gates too.
 
-Current compatibility finding: tested Codex CLI `0.155.1` sends MCP tools as
+Last recorded compatibility finding (2026-09-22): Codex CLI `0.155.1` sends MCP tools as
 Responses `namespace` tools. The current Qwen endpoint accepts flat function
 tools but rejects the namespace request with HTTP `400`. The scripts and
 configuration are ready to test; this backend is not ready for LAN rollout
@@ -51,43 +63,82 @@ just to run this stage; Codex integration follows on the client VPS.
 
 ## 2. Deploy the shared service VPS
 
-Copy the same harness revision to the service VPS and install the local-stage
-prerequisites. Copy `.env.example` to `.env` only if `.env` does not exist,
-set mode `600`, and replace the endpoint and secret fields below.
-`192.0.2.20` is documentation-only: use the VPS's explicit LAN address.
+Use a Linux VPS with Docker Engine and its Compose plugin, and OpenSSL for
+generating secrets. Copy/clone the same harness revision, including `docker/`
+(Compose bind-mounts those configuration and fixture files). Run all commands
+below from that checkout. The operator must have permission to use Docker.
+Python, Node.js, Codex, a GPU, a model server, and LiteLLM are not required on
+this MCP-only host. Browser and search dependencies run inside the containers.
 
-```dotenv
-SEARCH_MCP_PORT=18081
-PLAYWRIGHT_MCP_PORT=18082
-MCP_BIND_ADDRESS=192.0.2.20
-SEARCH_MCP_URL=http://192.0.2.20:18081/mcp
-PLAYWRIGHT_MCP_URL=http://192.0.2.20:18082/mcp
-SEARCH_MCP_ALLOWED_HOSTS=192.0.2.20:18081
-SEARCH_MCP_ALLOWED_ORIGINS=http://192.0.2.20:18081
-MCP_AUTH_TOKEN=replace-with-a-random-token
-SEARXNG_SECRET=replace-with-a-random-secret
+The existing stack contains:
 
-LLM_BASE_URL=http://192.168.110.16:1235/v1
-LLM_MODEL=qwen/qwen3.8-27b
-LLM_CONCURRENCY=3
-RAG_CORPUS_PATH=
-```
+| Compose service | Purpose | Published on the VPS |
+|---|---|---|
+| `searxng` | Search backend | No |
+| `search-mcp` | Authenticated Search MCP and URL reader | LAN IP, TCP `18081` |
+| `playwright` | Headless browser MCP | No |
+| `playwright-proxy` | Caddy bearer-auth proxy for Playwright | LAN IP, TCP `18082` |
+| `test-site` | Nginx fixture for later browser acceptance | No |
 
-Generate two independent secrets with `python3 -c 'import secrets;
-print(secrets.token_hex(32))'`. Distribute only the MCP token to approved
-client operators. Never commit environment files containing secrets.
+Caddy is already included; do not install a second host proxy. Its current
+configuration serves HTTP, not HTTPS. `/health` checks the proxy itself and
+is intentionally public; MCP requests require the bearer token. Search MCP
+enforces its own authentication. Neither proxy sits on the model traffic path.
 
-Apply the firewall policy below before starting the LAN-bound stack, then run:
+### Prepare the private VPS environment
 
 ```bash
-chmod 600 .env
-bash scripts/setup.sh
+umask 077
+test -e .env.vps || cp .env.vps.example .env.vps
+chmod 600 .env.vps
+
+# First output: MCP_AUTH_TOKEN. Second output: SEARXNG_SECRET.
+openssl rand -hex 32
+openssl rand -hex 32
 ```
 
-Require `PHASE11_LOCAL_READY` on this host too. Compose must publish only
-Search MCP on `18081` and the Playwright authentication proxy on `18082`,
-bound to the explicit LAN IP. SearXNG, Playwright itself, and `test-site`
-remain Docker-internal.
+Edit `.env.vps` before starting anything:
+
+- Replace `192.0.2.20` in the bind address, allowed hosts, and allowed origins
+  with the VPS's actual LAN interface IP. Do not bind `0.0.0.0` for this demo.
+- Replace both placeholder secrets with the two independently generated values.
+- If changing port `18081`, update both Search host/origin values too.
+
+The file contains only service variables; do not copy the client or model
+credentials into it. Keep assignments literal: the commands below source this
+trusted file. Exported shell values override Compose env files, so the subshell
+loads this file explicitly and keeps these credentials out of your parent shell.
+Distribute only the MCP URLs and `MCP_AUTH_TOKEN` to approved client operators;
+never distribute `SEARXNG_SECRET` or commit the private `.env.vps` file.
+
+### Start services without running tests
+
+Apply the firewall policy below before starting the LAN-bound stack. Then run:
+
+```bash
+(
+  set -e
+  set -a
+  source .env.vps
+  set +a
+  docker compose --env-file .env.vps -f compose.yaml config --quiet
+  docker compose --env-file .env.vps -f compose.yaml pull
+  docker compose --env-file .env.vps -f compose.yaml up -d --wait --wait-timeout 180
+  docker compose --env-file .env.vps -f compose.yaml ps
+)
+```
+
+Use `--env-file .env.vps -f compose.yaml` for subsequent Compose commands too.
+Do not use `scripts/setup.sh` on this MCP-only host: it is the local demo entry
+point and automatically runs the full verification suite using `.env`.
+
+`up --wait` only establishes Compose startup/health status, not working MCP
+tools or model compatibility. In particular, Caddy health does not prove the
+browser backend works. No `PHASE11_LOCAL_READY` marker is expected here; run
+the authenticated remote MCP checks from the client when ready (section 3).
+The two published ports must use the explicit LAN IP; all other services
+remain Docker-internal. Compose has a fixed project name, `codex-phase1`:
+do not run the local and VPS configurations as two stacks on the same host.
 
 ### Network acceptance
 
@@ -120,21 +171,37 @@ does not count as a pass. Record approved and unapproved source IPs/results.
 Plain HTTP with bearer tokens is suitable only for the isolated demo LAN;
 use TLS or a trusted encrypted overlay for untrusted network paths.
 
-## 3. Prepare a client VPS
+## 3. Prepare a client machine (workstation or client VPS)
 
-Install Python 3.11+, Bash, Git, ripgrep (`rg`), curl, Node.js, and Codex CLI.
-Install `gh` only if GitHub workflows need it. Use the same harness revision;
-this client does not run the service containers. Check shell prerequisites:
+Use a Bash environment with Python 3.11+, Git, curl, and Node.js. Ripgrep (`rg`)
+is recommended; the primitive verifier also accepts grep. Install `gh` only
+if GitHub workflows need it. Install Codex using the
+[official CLI setup guide](https://learn.chatgpt.com/docs/codex/cli), or keep
+the existing installation. This harness was checked with CLI `0.155.1`;
+record your version and repeat acceptance after upgrades.
+
+Copy/clone the same harness revision to each client. Do not run `setup.sh` or
+install Docker, Caddy, SearXNG, Playwright, or Chromium here. Each client needs
+network access to both MCP URLs **and directly to the separate LLM endpoint**.
+The shared MCP VPS does not relay model requests. Use sections 3 and 4 from
+the harness checkout; day-to-day Codex use can start in any project directory.
+
+### Keep OpenAI as the default
+
+Configure/authenticate plain `codex` with OpenAI first using its normal login
+flow. If OpenAI already works, keep the existing login/configuration.
+The installer requires a base config file to exist. If the default setup has
+not created one, create it without replacing any existing contents:
 
 ```bash
-python3 --version
-codex --version
-bash scripts/verify_client_primitives.sh
+mkdir -p "${CODEX_HOME:-$HOME/.codex}"
+touch "${CODEX_HOME:-$HOME/.codex}/config.toml"
 ```
 
-Configure and authenticate plain `codex` with OpenAI first. The installer
-requires `~/.codex/config.toml` to exist. Preserve its current authentication
-and unrelated plugins/MCP. If an earlier demo made Qwen the default or placed
+An empty base config uses Codex defaults. Paths in this guide assume the
+default `CODEX_HOME=~/.codex`; keep your own `CODEX_HOME` consistent if customized.
+Preserve its authentication and unrelated plugins/MCP.
+If an earlier demo made Qwen the default or placed
 `web_search`/`playwright` LAN entries in this base file, first restore its
 OpenAI model/provider and remove only those LAN server entries after backing
 up the file. Installing a profile does not repair a previously changed
@@ -143,6 +210,7 @@ default. Do not leave `profile = "openweight"` as the base default.
 Create a new client environment file from the template, then edit its values:
 
 ```bash
+umask 077
 test -e .env.client || cp .env.client.example .env.client
 chmod 600 .env.client
 ```
@@ -162,7 +230,7 @@ Environment files are trusted local input: shell commands below source them.
 Keep them as literal `KEY=VALUE` assignments. Use a subshell for each profile
 so values from one choice cannot persist into the next.
 
-### Install and check the opt-in configuration
+### Install the opt-in configuration (no runtime tests)
 
 ```bash
 (
@@ -171,14 +239,12 @@ so values from one choice cannot persist into the next.
   set -a
   source .env.client
   set +a
-  bash scripts/verify_remote_mcp.sh .env.client
   python3 scripts/install_codex_profile.py --env-file .env.client
-  python3 scripts/verify_codex_profile.py --env-file .env.client
 )
 ```
 
-Require `REMOTE_MCP_READY` and `CODEX_PROFILE_READY` before model-driven testing.
-The profile marker verifies configuration only, not end-to-end capability.
+The installer writes config/catalog only; it does not contact the model or
+MCP services, install Codex, or change the base OpenAI configuration.
 The installer supports `--profile NAME` and `--codex-home DIRECTORY` and writes:
 
 ```text
@@ -200,8 +266,33 @@ any different existing profile or catalog is refused, including one generated
 by an older installer. Back up and deliberately relocate both files before
 updating that choice, or use a new `--profile` name. The installed Codex
 must support separate `<name>.config.toml` profiles and `model_catalog_json`;
-the config-only check validates this with the installed binary before any
-model calls. Record the CLI version alongside integration results.
+the separate config-only check below validates this with the installed binary
+before any model calls. The profile file layout follows the
+[official profile configuration](https://learn.chatgpt.com/docs/config-file/config-advanced#profiles).
+
+### Verify explicitly when ready
+
+These are separate checks, not part of installing the profile. The remote
+check really searches the web and operates the browser on the MCP VPS.
+
+```bash
+(
+  set -e
+  unset LLM_API_KEY
+  set -a
+  source .env.client
+  set +a
+  python3 --version
+  codex --version
+  bash scripts/verify_client_primitives.sh
+  python3 scripts/verify_codex_profile.py --env-file .env.client
+  bash scripts/verify_remote_mcp.sh .env.client
+)
+```
+
+Require `CODEX_PROFILE_READY` and `REMOTE_MCP_READY` before model-driven testing.
+The profile marker verifies configuration only, not end-to-end capability.
+Record the CLI version alongside integration results.
 
 `http://test-site/` is a Docker-internal fixture. Browser MCP can visit it
 inside the service stack; the client host does not need a DNS entry, local
@@ -220,7 +311,7 @@ The operator runs this step on the target VPS, after section 3 passes:
   set +a
   python3 check_codex_api.py --base-url "$LLM_BASE_URL" --model "$LLM_MODEL" \
     --api-key-env LLM_API_KEY --check-namespaces
-  python3 -u verify_codex_vps.py --env-file .env.client --profile openweight
+  python3 -u verify_codex_vps.py --env-file .env.client --profile "$CODEX_PROFILE"
 )
 ```
 
@@ -252,14 +343,17 @@ OpenAI remains the ordinary command:
 codex
 ```
 
-Launch the LAN choice explicitly, keeping credentials out of shell arguments:
+Launch the LAN choice explicitly from the project you want Codex to work on.
+Replace `/absolute/path/to/harness/.env.client` below with your private client
+env file's absolute path; do not copy the secrets into every project. The
+subshell keeps credentials and provider selection out of your parent shell:
 
 ```bash
 (
   set -e
   unset LLM_API_KEY
   set -a
-  source .env.client
+  source /absolute/path/to/harness/.env.client
   set +a
   codex -p "$CODEX_PROFILE"
 )
@@ -267,6 +361,10 @@ Launch the LAN choice explicitly, keeping credentials out of shell arguments:
 
 `CODEX_PROFILE` is read by the harness scripts; native Codex is selected with
 `-p`. The last command is the environment-selected form, without a wrapper.
+Setting `CODEX_PROFILE` alone does not switch plain `codex`. For a fixed
+choice, `codex -p openweight` in the same loaded subshell is equivalent when
+that is the installed profile name. Exiting it does not change the OpenAI
+default; no repeated installation is needed when switching modes.
 
 For every additional client, allow its IP at the firewall and repeat sections
 3 and 4 with its own environment file. Require the remote, profile, and full
@@ -295,10 +393,11 @@ Choose plain `codex` to return to the base OpenAI setup. Retain generated
 profiles/catalogs until any needed session review is complete; remove only
 the named profile/catalog if deliberately uninstalling that choice.
 
-On the service VPS, stop containers while preserving the cache volume:
+On the service VPS, from the harness checkout, stop containers while
+preserving the cache volume:
 
 ```bash
-docker compose down
+docker compose --env-file .env.vps -f compose.yaml down
 ```
 
 Do not use `docker compose down -v` unless deliberate cache deletion is wanted.
