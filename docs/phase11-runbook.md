@@ -47,15 +47,16 @@ Bash, Git, curl, and Node.js. Run from the harness checkout:
 bash scripts/setup.sh
 ```
 
-This generates `.env` if absent, starts containers, then runs the unit tests,
+This generates `.env` if absent (or fills only the exact secret placeholders in
+an existing unedited copied template), starts containers, then runs the unit tests,
 client primitives, authenticated Responses API and namespace preflight, real
 Search/Playwright calls, and model runtime checks. Keep both
 `MCP_BIND_ADDRESS=127.0.0.1` and `LITELLM_BIND_ADDRESS=127.0.0.1` for this
 local-only stage. Set `LLM_BASE_URL=http://127.0.0.1:4000/v1` and make the local
 `LLM_API_KEY` equal `LITELLM_MASTER_KEY`; `LMSTUDIO_API_KEY` is the separate
 upstream credential. Use `LLM_CONTINUATION_MODE=input-history` for the bridge.
-Existing `.env` files are not rewritten: add the new bridge settings described
-below before rerunning setup. To repeat verification
+Existing non-placeholder `.env` values are never rewritten. An older or incomplete
+`.env` still needs the new bridge settings described below before rerunning setup. To repeat verification
 without pulling/restarting containers:
 
 ```bash

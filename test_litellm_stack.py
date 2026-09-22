@@ -82,7 +82,7 @@ class LiteLLMStackTest(unittest.TestCase):
         return subprocess.run(["bash", str(root / "scripts/setup.sh")], env=env,
                               capture_output=True, text=True, timeout=10)
 
-    def test_setup_generates_matching_gateway_client_keys_without_touching_existing_env(self):
+    def test_setup_generates_template_secrets_and_preserves_incomplete_existing_env(self):
         with tempfile.TemporaryDirectory() as directory:
             result = self.run_setup(directory)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -95,6 +95,16 @@ class LiteLLMStackTest(unittest.TestCase):
             self.assertNotIn("replace", values["LLM_API_KEY"])
             self.assertNotEqual(values["LLM_API_KEY"], values["MCP_AUTH_TOKEN"])
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+        with tempfile.TemporaryDirectory() as directory:
+            template = (ROOT / ".env.example").read_text()
+            result = self.run_setup(directory, template)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            values = dict(line.split("=", 1) for line in Path(directory, ".env").read_text().splitlines()
+                          if line and not line.startswith("#"))
+            self.assertEqual(values["LLM_API_KEY"], values["LITELLM_MASTER_KEY"])
+            self.assertNotIn("replace-with", Path(directory, ".env").read_text())
+            self.assertEqual(Path(directory, ".env").stat().st_mode & 0o777, 0o600)
 
         with tempfile.TemporaryDirectory() as directory:
             original = "MCP_AUTH_TOKEN=old-token\nSEARXNG_SECRET=old-secret\n"
